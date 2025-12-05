@@ -1,0 +1,24 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: linkedin-reposter
+    ports:
+      - "8080:8080"
+    environment:
+      - INFISICAL_URL=${INFISICAL_URL:-https://infisical.example.com}
+      - INFISICAL_TOKEN=${INFISICAL_TOKEN}
+      - INFISICAL_PROJECT_ID=${INFISICAL_PROJECT_ID:-LinkedInReposter}
+      - INFISICAL_ENVIRONMENT=${INFISICAL_ENVIRONMENT:-dev}
+      - APP_PORT=${APP_PORT:-8080}
+      - AI_MODEL=${AI_MODEL:-gpt-4o}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
