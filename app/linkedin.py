@@ -66,13 +66,22 @@ class LinkedInAutomation:
         Args:
             headless: Run browser in headless mode (default: True)
         """
+        import os
+        
         self.settings = get_settings()
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.playwright = None
         self.is_logged_in = False
-        self.headless = headless
+        
+        # Check if DISPLAY is set (VNC mode) - if so, run non-headless
+        if os.environ.get('DISPLAY'):
+            logger.info("🖥️  DISPLAY detected - running in headed mode for VNC")
+            self.headless = False
+        else:
+            self.headless = headless
+            
         self.session_needs_refresh = False
         self.session_expired = False
         

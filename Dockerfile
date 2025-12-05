@@ -4,7 +4,7 @@
 # Stage 1: Base image with system dependencies
 FROM python:3.11-slim-bullseye AS base
 
-# Install system dependencies for Playwright
+# Install system dependencies for Playwright and VNC
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -29,6 +29,9 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     xdg-utils \
     curl \
+    x11vnc \
+    xvfb \
+    fluxbox \
     && rm -rf /var/lib/apt/lists/*
 
 # Stage 2: Install Python dependencies
@@ -59,6 +62,11 @@ COPY --from=deps /usr/local/bin /usr/local/bin
 # Copy application code
 COPY app/ ./app/
 
+# Copy VNC startup script and entrypoint
+COPY start-vnc.sh /usr/local/bin/
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/start-vnc.sh /usr/local/bin/docker-entrypoint.sh
+
 # Create non-root user for security
 RUN useradd -m -u 1000 appuser && \
     chown -R appuser:appuser /app
@@ -74,12 +82,13 @@ RUN chown -R appuser:appuser /home/appuser/.cache
 # Switch to non-root user
 USER appuser
 
-# Expose port
+# Expose ports
 EXPOSE 8080
+EXPOSE 5900
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
-# Run the application
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Run the application with VNC support
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
