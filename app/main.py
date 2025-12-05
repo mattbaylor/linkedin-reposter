@@ -94,7 +94,7 @@ async def check_and_publish_posts():
                     await linkedin.start()
                     
                     # Check session health
-                    health = await linkedin.check_session_health()
+                    health = linkedin.check_session_health()
                     if health["status"] == "expired":
                         logger.error("❌ LinkedIn session expired - cannot publish posts")
                         return
@@ -1065,10 +1065,22 @@ async def linkedin_session_status():
             }
         
         # Get session age
-        age_days = await linkedin.get_session_age()
+        age_days = linkedin.get_session_age()
         
         # Check session health
-        health = await linkedin.check_session_health()
+        health = linkedin.check_session_health()
+        
+        # Create appropriate message based on status
+        if health["status"] == "healthy":
+            message = f"Session is healthy (age: {age_days} days)"
+        elif health["status"] == "warning":
+            message = f"Session is {age_days} days old and should be refreshed soon"
+        elif health["status"] == "expired":
+            message = f"Session expired (age: {age_days} days) - please re-authenticate"
+        elif health["status"] == "unknown_age":
+            message = "Session exists but age cannot be determined"
+        else:
+            message = "Session status unknown"
         
         log_operation_success(
             logger,
@@ -1082,7 +1094,7 @@ async def linkedin_session_status():
             "session_file": session_file,
             "age_days": age_days,
             "health_status": health["status"],
-            "message": health["message"],
+            "message": message,
             "email_sent": health.get("email_sent", False),
             "warnings": health.get("warnings", []),
             "recommendations": health.get("recommendations", [])
@@ -1129,7 +1141,7 @@ async def linkedin_scrape(
     
     try:
         # Check session health first
-        health = await linkedin.check_session_health()
+        health = linkedin.check_session_health()
         
         if health["status"] == "expired":
             logger.error(f"❌ LinkedIn session expired - cannot scrape")
@@ -1139,7 +1151,7 @@ async def linkedin_scrape(
             )
         
         if health["status"] == "warning":
-            logger.warning(f"⚠️  LinkedIn session expiring soon (age: {await linkedin.get_session_age()} days)")
+            logger.warning(f"⚠️  LinkedIn session expiring soon (age: {linkedin.get_session_age()} days)")
         
         # Start LinkedIn service
         await linkedin.start()
@@ -1277,7 +1289,7 @@ async def linkedin_publish(post_id: int, db: AsyncSession = Depends(get_db)):
             )
         
         # Check session health
-        health = await linkedin.check_session_health()
+        health = linkedin.check_session_health()
         
         if health["status"] == "expired":
             logger.error(f"❌ LinkedIn session expired - cannot publish")

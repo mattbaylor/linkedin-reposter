@@ -248,43 +248,45 @@ class LinkedInAutomation:
         try:
             self.playwright = await async_playwright().start()
             
-            # Check session health first
-            health = self.check_session_health()
-            logger.info(f"📊 Session health: {health['status']}")
-            
-            if health['age_days'] is not None:
-                logger.info(f"   Session age: {health['age_days']} days")
-            
-            # Handle expired session
-            if health['expired'] and self.headless:
-                logger.error("❌ Session expired and running in headless mode!")
-                
-                # Send alert email
-                await self.send_session_alert('expired')
-                
-                raise Exception(
-                    f"LinkedIn session expired (age: {health['age_days']} days). "
-                    "Please check your email for refresh instructions."
-                )
-            
-            # Handle warning state
-            if health['needs_refresh'] and not health['expired']:
-                logger.warning(f"⚠️  Session is {health['age_days']} days old and should be refreshed soon")
-                # Send warning email (but don't block operation)
-                await self.send_session_alert('warning')
-            
             # Check if we have a saved session
             has_session = self.session_file.exists()
             
-            if not has_session and self.headless:
-                logger.warning("⚠️  No saved session found and running in headless mode!")
+            # Only check session health if requested
+            if check_session:
+                # Check session health first
+                health = self.check_session_health()
+                logger.info(f"📊 Session health: {health['status']}")
                 
-                # Send alert
-                await self.send_session_alert('expired')
+                if health['age_days'] is not None:
+                    logger.info(f"   Session age: {health['age_days']} days")
                 
-                raise Exception(
-                    "No LinkedIn session found. Check your email for setup instructions."
-                )
+                # Handle expired session
+                if health['expired'] and self.headless:
+                    logger.error("❌ Session expired and running in headless mode!")
+                    
+                    # Send alert email
+                    await self.send_session_alert('expired')
+                    
+                    raise Exception(
+                        f"LinkedIn session expired (age: {health['age_days']} days). "
+                        "Please check your email for refresh instructions."
+                    )
+                
+                # Handle warning state
+                if health['needs_refresh'] and not health['expired']:
+                    logger.warning(f"⚠️  Session is {health['age_days']} days old and should be refreshed soon")
+                    # Send warning email (but don't block operation)
+                    await self.send_session_alert('warning')
+                
+                if not has_session and self.headless:
+                    logger.warning("⚠️  No saved session found and running in headless mode!")
+                    
+                    # Send alert
+                    await self.send_session_alert('expired')
+                    
+                    raise Exception(
+                        "No LinkedIn session found. Check your email for setup instructions."
+                    )
             
             # Launch browser
             self.browser = await self.playwright.chromium.launch(
@@ -468,22 +470,17 @@ class LinkedInAutomation:
             
             logger.info("🍪 Cookie added to browser context")
             
-            # Navigate to LinkedIn to verify cookie works
-            await self.page.goto("https://www.linkedin.com/feed/", wait_until="networkidle")
+            # Just save the session - we'll verify it works during actual scraping
+            await self._save_session()
+            logger.info("✅ Cookie saved to session file")
+            log_operation_success(logger, "login_with_cookies")
+            self.is_logged_in = True
             
-            # Check if logged in
-            is_valid = await self._check_logged_in()
-            
-            if is_valid:
-                # Save the session
-                await self._save_session()
-                logger.info("✅ Cookie authentication successful, session saved")
-                log_operation_success(logger, "login_with_cookies")
-                self.is_logged_in = True
-                return True
-            else:
-                logger.error("❌ Cookie is invalid or expired")
-                return False
+            return {
+                "success": True,
+                "message": "Cookie saved successfully",
+                "session_file": str(self.session_file)
+            }
             
         except Exception as e:
             log_operation_error(logger, "login_with_cookies", e)
