@@ -3,6 +3,7 @@ import logging
 import asyncio
 import json
 import time
+import os
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -155,6 +156,16 @@ class LinkedInSeleniumAutomation:
             
             if self.headless:
                 options.add_argument('--headless=new')
+            
+            # Set user data directory to avoid temp dir creation issues
+            browser_data_dir = "/app/data/browser_data"
+            os.makedirs(browser_data_dir, exist_ok=True)
+            options.add_argument(f'--user-data-dir={browser_data_dir}')
+            
+            # Set additional directories to avoid permission issues
+            options.add_argument(f'--disk-cache-dir={browser_data_dir}/cache')
+            options.add_argument(f'--data-path={browser_data_dir}/data')
+            options.add_argument('--disable-extensions')
             
             # Stealth arguments
             options.add_argument('--no-sandbox')
