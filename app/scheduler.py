@@ -111,7 +111,7 @@ class PostScheduler:
                 last_scheduled = max(post.scheduled_for for post in scheduled_posts)
                 candidate_time = last_scheduled + timedelta(minutes=self.min_spacing_minutes)
             else:
-                candidate_time = datetime.now()
+                candidate_time = datetime.now(timezone.utc)
             logger.info(f"⚠️  STALE post - adding to back of queue")
             candidate_time = self._find_normal_slot(scheduled_posts, candidate_time, priority['level'])
         else:
