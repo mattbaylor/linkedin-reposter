@@ -935,6 +935,84 @@ async def admin_trigger_scrape(db: AsyncSession = Depends(get_db)):
     }
 
 
+@app.post("/admin/regenerate-all-missing")
+async def admin_regenerate_all_missing(db: AsyncSession = Depends(get_db)):
+    """Regenerate AI variants for all posts that don't have any variants yet."""
+    log_operation_start(logger, "admin_regenerate_all_missing")
+    
+    # Find posts without variants
+    result = await db.execute(
+        select(LinkedInPost)
+        .outerjoin(PostVariant)
+        .group_by(LinkedInPost.id)
+        .having(func.count(PostVariant.id) == 0)
+    )
+    posts_without_variants = result.scalars().all()
+    
+    if not posts_without_variants:
+        return {
+            "success": True,
+            "message": "No posts found without variants",
+            "count": 0
+        }
+    
+    logger.info(f"🔄 Regenerating variants for {len(posts_without_variants)} posts...")
+    
+    # Process in background
+    async def generate_missing_variants():
+        ai_service = get_ai_service()
+        success_count = 0
+        failed_count = 0
+        
+        async for db_session in get_db():
+            for post in posts_without_variants:
+                try:
+                    logger.info(f"🤖 Generating variants for post {post.id} from @{post.author_handle}")
+                    
+                    # Generate 3 variants
+                    variants = await ai_service.generate_variants(
+                        original_content=post.original_content,
+                        author_name=post.author_name,
+                        author_handle=post.author_handle
+                    )
+                    
+                    # Save variants to database
+                    for i, variant_text in enumerate(variants, 1):
+                        variant = PostVariant(
+                            original_post_id=post.id,
+                            variant_number=i,
+                            variant_content=variant_text,
+                            status=VariantStatus.PENDING
+                        )
+                        db_session.add(variant)
+                    
+                    # Update post status
+                    post.status = PostStatus.AWAITING_APPROVAL
+                    await db_session.commit()
+                    
+                    success_count += 1
+                    logger.info(f"✅ Generated {len(variants)} variants for post {post.id}")
+                    
+                except Exception as e:
+                    failed_count += 1
+                    logger.error(f"❌ Failed to generate variants for post {post.id}: {e}")
+                    await db_session.rollback()
+            
+            logger.info(f"✅ Batch complete: {success_count} successful, {failed_count} failed")
+            break
+    
+    # Run in background
+    asyncio.create_task(generate_missing_variants())
+    
+    log_operation_success(logger, "admin_regenerate_all_missing", count=len(posts_without_variants))
+    
+    return {
+        "success": True,
+        "message": f"Generating variants for {len(posts_without_variants)} posts in background. Check logs for progress.",
+        "count": len(posts_without_variants)
+    }
+
+
 @app.get("/stats", response_model=StatsResponse)
 async def get_stats(db: AsyncSession = Depends(get_db)):
     """Get statistics about posts and processing."""

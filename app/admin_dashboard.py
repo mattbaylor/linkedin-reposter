@@ -404,6 +404,7 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                     </select>
                 </label>
                 <button onclick="triggerScrape()" class="btn btn-primary btn-sm">🔍 Scrape Now</button>
+                <button onclick="regenerateAllMissing()" class="btn btn-primary btn-sm">🤖 Generate Missing Variants</button>
                 <button onclick="window.location.reload()" class="btn btn-primary btn-sm">🔄 Refresh</button>
             </div>
             
@@ -522,6 +523,31 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                     }} else {{
                         const error = await response.json();
                         alert('❌ Error: ' + (error.detail || 'Failed to trigger scrape'));
+                    }}
+                }} catch (err) {{
+                    alert('❌ Network error: ' + err.message);
+                }} finally {{
+                    document.body.style.cursor = 'default';
+                }}
+            }}
+            
+            async function regenerateAllMissing() {{
+                if (!confirm('🤖 Generate AI variants for all posts that don\\'t have any?\\n\\nThis will use GitHub Copilot to generate variants. This may take a few minutes.')) return;
+                
+                document.body.style.cursor = 'wait';
+                
+                try {{
+                    const response = await fetch('/admin/regenerate-all-missing', {{
+                        method: 'POST'
+                    }});
+                    
+                    if (response.ok) {{
+                        const data = await response.json();
+                        alert('✅ ' + data.message + '\\n\\nGenerating variants for ' + data.count + ' posts.');
+                        setTimeout(() => window.location.reload(), 5000);
+                    }} else {{
+                        const error = await response.json();
+                        alert('❌ Error: ' + (error.detail || 'Failed to regenerate variants'));
                     }}
                 }} catch (err) {{
                     alert('❌ Network error: ' + err.message);
