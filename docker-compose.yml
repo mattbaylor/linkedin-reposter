@@ -22,6 +22,7 @@ services:
       - AI_MODEL=${AI_MODEL:-gpt-4o}
       - VNC_PASSWORD=${VNC_PASSWORD:-linkedin123}
       - DISPLAY=:99
+      - TZ=${TZ:-America/Denver}
     volumes:
       - ./data:/app/data
     shm_size: '2gb'

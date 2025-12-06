@@ -59,14 +59,14 @@ class PostScheduler:
         1. Calculate post age and golden hour priority
         2. Get all currently scheduled posts
         3. Find next available time slot based on priority:
-           - URGENT (< 3h): Schedule ASAP (next available slot)
+           - URGENT (< 3h): Schedule ASAP - can bump lower priority posts
            - GOOD (< 12h): Schedule today if possible
            - OK (< 24h): Normal scheduling
            - STALE (> 48h): Low priority (back of queue)
         4. Ensure slot satisfies constraints:
            - Within posting hours (6am-9pm MST)
            - Not on weekend (if weekdays_only=true)
-           - Doesn't exceed daily post limit
+           - Daily limit (URGENT can override by bumping STALE posts)
            - Has minimum spacing from previous post
         5. Add random jitter for natural appearance
         
@@ -101,15 +101,10 @@ class PostScheduler:
         scheduled_posts = await self._get_all_scheduled_posts(db)
         logger.info(f"📊 Current queue: {len(scheduled_posts)} posts scheduled")
         
-        # Find next available slot based on priority
+        # URGENT posts use special logic to bump lower-priority posts
         if priority['level'] == 'URGENT':
-            # URGENT: Schedule ASAP (next available slot, even if it pushes other posts)
-            candidate_time = datetime.now()
-            logger.info(f"🔥 URGENT post - scheduling ASAP")
-        elif priority['level'] == 'GOOD':
-            # GOOD: Try to schedule today, otherwise next available
-            candidate_time = datetime.now()
-            logger.info(f"✅ GOOD timing - trying to schedule today")
+            logger.info(f"🔥 URGENT post - finding earliest slot (can bump lower-priority posts)")
+            candidate_time = await self._find_urgent_slot(db, scheduled_posts, priority)
         elif priority['level'] == 'STALE':
             # STALE: Back of the queue
             if scheduled_posts:
@@ -118,56 +113,55 @@ class PostScheduler:
             else:
                 candidate_time = datetime.now()
             logger.info(f"⚠️  STALE post - adding to back of queue")
+            candidate_time = self._find_normal_slot(scheduled_posts, candidate_time, priority['level'])
         else:
-            # OK: Normal scheduling
+            # GOOD or OK: Normal scheduling from now
             candidate_time = datetime.now()
-            logger.info(f"⏰ Normal scheduling")
+            logger.info(f"{'✅ GOOD' if priority['level'] == 'GOOD' else '⏰ OK'} timing - normal scheduling")
+            candidate_time = self._find_normal_slot(scheduled_posts, candidate_time, priority['level'])
         
-        # Find valid slot
-        iteration = 0
-        max_iterations = 365  # Safety limit: don't schedule more than a year out
+        # Add jitter for natural appearance
+        if self.enable_jitter:
+            jitter = random.randint(-self.jitter_minutes, self.jitter_minutes)
+            candidate_time = candidate_time + timedelta(minutes=jitter)
+            logger.debug(f"   Applied jitter: {jitter:+d} minutes")
         
-        while iteration < max_iterations:
-            iteration += 1
-            
-            # Normalize to start of posting hours if before/after
-            candidate_time = self._normalize_to_posting_hours(candidate_time)
-            
-            # Skip weekends if configured
-            if self.posting_weekdays_only and candidate_time.weekday() in [5, 6]:
-                logger.debug(f"   Skipping weekend: {candidate_time.strftime('%A %Y-%m-%d')}")
-                candidate_time = self._move_to_next_weekday(candidate_time)
-                continue
-            
-            # Check if this day is at daily limit
-            posts_on_day = self._count_posts_on_day(scheduled_posts, candidate_time.date())
-            if posts_on_day >= self.daily_post_limit:
-                logger.debug(
-                    f"   Day {candidate_time.date()} at limit "
-                    f"({posts_on_day}/{self.daily_post_limit} posts)"
-                )
-                candidate_time = self._move_to_next_day(candidate_time)
-                continue
-            
-            # Check spacing from last scheduled post
-            last_post_time = self._get_last_scheduled_time_before(scheduled_posts, candidate_time)
-            if last_post_time:
-                time_diff = (candidate_time - last_post_time).total_seconds() / 60
-                if time_diff < self.min_spacing_minutes:
-                    # Move forward by remaining spacing needed
-                    needed_spacing = self.min_spacing_minutes - time_diff
-                    candidate_time = candidate_time + timedelta(minutes=needed_spacing)
-                    logger.debug(
-                        f"   Spacing violation: need {needed_spacing:.0f} more minutes from last post"
-                    )
-                    continue
-            
-            # Found valid slot!
-            logger.info(f"✅ Found slot: {candidate_time.strftime('%A %b %d at %I:%M%p')}")
-            break
+        # Create scheduled post entry with priority information
+        scheduled_post = ScheduledPost(
+            post_id=post_id,
+            variant_id=variant_id,
+            approved_at=datetime.now(),
+            scheduled_for=candidate_time,
+            status=ScheduledPostStatus.PENDING,
+            priority_level=priority['level'],
+            priority_score=priority['priority_score'],
+            post_age_hours=priority['age_hours']
+        )
         
-        if iteration >= max_iterations:
-            logger.warning(f"⚠️  Hit max iterations finding slot - scheduling far in future")
+        db.add(scheduled_post)
+        await db.commit()
+        await db.refresh(scheduled_post)
+        
+        # Log with priority context
+        time_until = (candidate_time - datetime.now()).total_seconds() / 60
+        if time_until < 60:
+            time_str = f"{time_until:.0f} minutes"
+        elif time_until < 1440:
+            time_str = f"{time_until/60:.1f} hours"
+        else:
+            time_str = f"{time_until/1440:.1f} days"
+        
+        logger.info(
+            f"📅 Scheduled post {post_id} for {candidate_time.strftime('%A %b %d at %I:%M%p')} "
+            f"({time_str} from now) | Priority: {priority['emoji']} {priority['level']}"
+        )
+        
+        log_operation_success(
+            logger,
+            "assign_publish_slot",
+            post_id=post_id,
+            scheduled_for=candidate_time.isoformat()
+        )
         
         # Add jitter for natural appearance
         if self.enable_jitter:
@@ -213,6 +207,241 @@ class PostScheduler:
         )
         
         return candidate_time
+    
+    async def _find_urgent_slot(
+        self,
+        db: AsyncSession,
+        scheduled_posts: List[ScheduledPost],
+        priority: dict
+    ) -> datetime:
+        """
+        Find the earliest possible slot for an URGENT post.
+        Can bump lower-priority posts if necessary.
+        
+        Strategy:
+        1. Start from NOW
+        2. Look for first valid slot (respecting spacing, posting hours, weekends)
+        3. If slot is blocked by a STALE post, bump it later
+        4. If day is at limit but has STALE posts, bump one STALE post to make room
+        5. Otherwise find next available slot
+        """
+        candidate_time = datetime.now()
+        iteration = 0
+        max_iterations = 365
+        
+        while iteration < max_iterations:
+            iteration += 1
+            
+            # Normalize to posting hours
+            candidate_time = self._normalize_to_posting_hours(candidate_time)
+            
+            # Skip weekends
+            if self.posting_weekdays_only and candidate_time.weekday() in [5, 6]:
+                logger.debug(f"   Skipping weekend: {candidate_time.strftime('%A %Y-%m-%d')}")
+                candidate_time = self._move_to_next_weekday(candidate_time)
+                continue
+            
+            # Check spacing from previous post
+            last_post_time = self._get_last_scheduled_time_before(scheduled_posts, candidate_time)
+            if last_post_time:
+                time_diff = (candidate_time - last_post_time).total_seconds() / 60
+                if time_diff < self.min_spacing_minutes:
+                    needed_spacing = self.min_spacing_minutes - time_diff
+                    candidate_time = candidate_time + timedelta(minutes=needed_spacing)
+                    logger.debug(f"   Spacing violation: need {needed_spacing:.0f} more minutes")
+                    continue
+            
+            # Check spacing to next post
+            next_post = self._get_next_scheduled_post_after(scheduled_posts, candidate_time)
+            if next_post:
+                time_diff = (next_post.scheduled_for - candidate_time).total_seconds() / 60
+                if time_diff < self.min_spacing_minutes:
+                    # Check if we can bump this post if it's lower priority
+                    if self._can_bump_post(next_post):
+                        # Bump it later
+                        new_time = candidate_time + timedelta(minutes=self.min_spacing_minutes)
+                        logger.info(
+                            f"   🔄 Bumping {next_post.priority_level or 'UNKNOWN'} post "
+                            f"from {next_post.scheduled_for.strftime('%I:%M%p')} "
+                            f"to {new_time.strftime('%I:%M%p')}"
+                        )
+                        await self._bump_post_and_cascade(db, scheduled_posts, next_post, new_time)
+                        # Refresh our list of scheduled posts after bumping
+                        scheduled_posts = await self._get_all_scheduled_posts(db)
+                    else:
+                        # Can't bump, move to after this post
+                        candidate_time = next_post.scheduled_for + timedelta(minutes=self.min_spacing_minutes)
+                        logger.debug(f"   Can't bump higher-priority post, moving to after it")
+                        continue
+            
+            # Check daily limit
+            posts_on_day = self._count_posts_on_day(scheduled_posts, candidate_time.date())
+            if posts_on_day >= self.daily_post_limit:
+                # Try to find a STALE post on this day to bump to next day
+                stale_post = self._find_bumpable_post_on_day(scheduled_posts, candidate_time.date())
+                if stale_post:
+                    # Bump the STALE post to the next day
+                    next_day_time = self._move_to_next_day(stale_post.scheduled_for)
+                    logger.info(
+                        f"   🔄 Daily limit reached - bumping STALE post to next day "
+                        f"({stale_post.scheduled_for.date()} → {next_day_time.date()})"
+                    )
+                    await self._bump_post_and_cascade(db, scheduled_posts, stale_post, next_day_time)
+                    # Refresh our list after bumping
+                    scheduled_posts = await self._get_all_scheduled_posts(db)
+                    # Try this slot again
+                    continue
+                else:
+                    # No bumpable posts, move to next day
+                    logger.debug(f"   Day {candidate_time.date()} at limit, no bumpable posts")
+                    candidate_time = self._move_to_next_day(candidate_time)
+                    continue
+            
+            # Found valid slot!
+            logger.info(f"✅ Found URGENT slot: {candidate_time.strftime('%A %b %d at %I:%M%p')}")
+            return candidate_time
+        
+        logger.warning(f"⚠️  Hit max iterations for URGENT post - using far future slot")
+        return candidate_time
+    
+    def _find_normal_slot(
+        self,
+        scheduled_posts: List[ScheduledPost],
+        start_time: datetime,
+        priority_level: str
+    ) -> datetime:
+        """
+        Find a normal slot for non-URGENT posts.
+        Uses the original scheduling algorithm (no bumping).
+        """
+        candidate_time = start_time
+        iteration = 0
+        max_iterations = 365
+        
+        while iteration < max_iterations:
+            iteration += 1
+            
+            # Normalize to posting hours
+            candidate_time = self._normalize_to_posting_hours(candidate_time)
+            
+            # Skip weekends
+            if self.posting_weekdays_only and candidate_time.weekday() in [5, 6]:
+                logger.debug(f"   Skipping weekend: {candidate_time.strftime('%A %Y-%m-%d')}")
+                candidate_time = self._move_to_next_weekday(candidate_time)
+                continue
+            
+            # Check daily limit
+            posts_on_day = self._count_posts_on_day(scheduled_posts, candidate_time.date())
+            if posts_on_day >= self.daily_post_limit:
+                logger.debug(
+                    f"   Day {candidate_time.date()} at limit "
+                    f"({posts_on_day}/{self.daily_post_limit} posts)"
+                )
+                candidate_time = self._move_to_next_day(candidate_time)
+                continue
+            
+            # Check spacing from last scheduled post
+            last_post_time = self._get_last_scheduled_time_before(scheduled_posts, candidate_time)
+            if last_post_time:
+                time_diff = (candidate_time - last_post_time).total_seconds() / 60
+                if time_diff < self.min_spacing_minutes:
+                    needed_spacing = self.min_spacing_minutes - time_diff
+                    candidate_time = candidate_time + timedelta(minutes=needed_spacing)
+                    logger.debug(f"   Spacing violation: need {needed_spacing:.0f} more minutes")
+                    continue
+            
+            # Found valid slot!
+            logger.info(f"✅ Found slot: {candidate_time.strftime('%A %b %d at %I:%M%p')}")
+            return candidate_time
+        
+        logger.warning(f"⚠️  Hit max iterations - scheduling far in future")
+        return candidate_time
+    
+    def _can_bump_post(self, post: ScheduledPost) -> bool:
+        """Check if a post can be bumped (only STALE and OK posts can be bumped by URGENT)."""
+        if not post.priority_level:
+            return True  # Unknown priority, assume bumpable
+        return post.priority_level in ['STALE', 'OK']
+    
+    def _find_bumpable_post_on_day(
+        self,
+        scheduled_posts: List[ScheduledPost],
+        target_date: date
+    ) -> Optional[ScheduledPost]:
+        """Find a STALE post on a specific day that can be bumped."""
+        day_posts = [
+            post for post in scheduled_posts
+            if post.scheduled_for.date() == target_date and self._can_bump_post(post)
+        ]
+        
+        if not day_posts:
+            return None
+        
+        # Return the STALE post with lowest priority, or just the last one
+        stale_posts = [p for p in day_posts if p.priority_level == 'STALE']
+        if stale_posts:
+            return stale_posts[0]  # Return first STALE post
+        
+        # If no STALE, return first OK post
+        ok_posts = [p for p in day_posts if p.priority_level == 'OK']
+        if ok_posts:
+            return ok_posts[0]
+        
+        return None
+    
+    def _get_next_scheduled_post_after(
+        self,
+        scheduled_posts: List[ScheduledPost],
+        candidate_time: datetime
+    ) -> Optional[ScheduledPost]:
+        """Get the next post scheduled after candidate_time."""
+        posts_after = [
+            post for post in scheduled_posts
+            if post.scheduled_for > candidate_time
+        ]
+        
+        if not posts_after:
+            return None
+        
+        # Return the earliest one
+        return min(posts_after, key=lambda p: p.scheduled_for)
+    
+    async def _bump_post_and_cascade(
+        self,
+        db: AsyncSession,
+        scheduled_posts: List[ScheduledPost],
+        post_to_bump: ScheduledPost,
+        new_time: datetime
+    ) -> None:
+        """
+        Bump a post to a new time and cascade any conflicts.
+        
+        This recursively bumps posts if they conflict with the new time.
+        """
+        # Update the post's scheduled time
+        old_time = post_to_bump.scheduled_for
+        post_to_bump.scheduled_for = new_time
+        
+        await db.commit()
+        await db.refresh(post_to_bump)
+        
+        logger.debug(
+            f"   Bumped post {post_to_bump.post_id}: "
+            f"{old_time.strftime('%I:%M%p')} → {new_time.strftime('%I:%M%p')}"
+        )
+        
+        # Check if this creates a conflict with the next post
+        # Refresh the scheduled_posts list to get updated times
+        scheduled_posts_updated = await self._get_all_scheduled_posts(db)
+        next_post = self._get_next_scheduled_post_after(scheduled_posts_updated, new_time)
+        
+        if next_post and next_post.id != post_to_bump.id:
+            time_diff = (next_post.scheduled_for - new_time).total_seconds() / 60
+            if time_diff < self.min_spacing_minutes:
+                # Cascade: bump the next post too
+                cascade_time = new_time + timedelta(minutes=self.min_spacing_minutes)
+                logger.debug(f"   Cascading bump to post {next_post.post_id}")
+                await self._bump_post_and_cascade(db, scheduled_posts_updated, next_post, cascade_time)
     
     async def _get_all_scheduled_posts(self, db: AsyncSession) -> List[ScheduledPost]:
         """Get all scheduled posts (pending or recently published)."""

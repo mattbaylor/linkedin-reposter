@@ -160,6 +160,22 @@ class LinkedInSeleniumAutomation:
             # Set user data directory to avoid temp dir creation issues
             browser_data_dir = "/app/data/browser_data"
             os.makedirs(browser_data_dir, exist_ok=True)
+            
+            # Clean up stale lock files that can prevent Chrome from starting
+            lock_files = [
+                f"{browser_data_dir}/SingletonLock",
+                f"{browser_data_dir}/SingletonSocket",
+                f"{browser_data_dir}/SingletonCookie"
+            ]
+            for lock_file in lock_files:
+                try:
+                    if os.path.exists(lock_file):
+                        os.remove(lock_file)
+                        logger.debug(f"🧹 Removed stale lock file: {lock_file}")
+                except Exception as e:
+                    logger.debug(f"⚠️  Could not remove {lock_file}: {e}")
+            
+            # Set additional directories to avoid permission issues
             options.add_argument(f'--user-data-dir={browser_data_dir}')
             
             # Set additional directories to avoid permission issues
@@ -167,14 +183,15 @@ class LinkedInSeleniumAutomation:
             options.add_argument(f'--data-path={browser_data_dir}/data')
             options.add_argument('--disable-extensions')
             
-            # Stealth arguments
+            # Essential Docker/Container arguments
             options.add_argument('--no-sandbox')
             options.add_argument('--disable-dev-shm-usage')
-            options.add_argument('--disable-blink-features=AutomationControlled')
             options.add_argument('--disable-gpu')
+            
+            # Stealth arguments
+            options.add_argument('--disable-blink-features=AutomationControlled')
             options.add_argument('--window-size=1920,1080')
             options.add_argument('--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-            options.add_argument('--disable-blink-features=AutomationControlled')
             options.add_experimental_option("excludeSwitches", ["enable-automation"])
             options.add_experimental_option('useAutomationExtension', False)
             
@@ -213,38 +230,144 @@ class LinkedInSeleniumAutomation:
                 from selenium.webdriver.support.ui import WebDriverWait
                 from selenium.webdriver.support import expected_conditions as EC
                 
-                logger.info("🔑 Logging in with email/password...")
-                self.driver.get("https://www.linkedin.com/login")
+                # First, try to load saved cookies if they exist
+                if self.cookies_file.exists():
+                    logger.info("🍪 Found saved cookies, loading them...")
+                    try:
+                        # Navigate to LinkedIn first so cookies can be set
+                        self.driver.get("https://www.linkedin.com")
+                        time.sleep(2)
+                        
+                        # Load and add cookies
+                        with open(self.cookies_file, 'r') as f:
+                            cookies = json.load(f)
+                            for cookie in cookies:
+                                try:
+                                    self.driver.add_cookie(cookie)
+                                except Exception as e:
+                                    logger.debug(f"⚠️  Could not add cookie {cookie.get('name')}: {e}")
+                        
+                        logger.info(f"✅ Loaded {len(cookies)} cookies from file")
+                        
+                        # Refresh to apply cookies
+                        self.driver.refresh()
+                        time.sleep(2)
+                        
+                    except Exception as e:
+                        logger.warning(f"⚠️  Could not load cookies: {e}")
+                
+                # Now check login status
+                logger.info("🔑 Checking login status...")
+                self.driver.get("https://www.linkedin.com/feed")
                 time.sleep(3)
                 
-                # Fill email
-                email_field = WebDriverWait(self.driver, 10).until(
-                    EC.presence_of_element_located((By.ID, "username"))
-                )
-                email_field.send_keys(self.email)
-                
-                # Fill password
-                password_field = self.driver.find_element(By.ID, "password")
-                password_field.send_keys(self.password)
-                
-                # Click sign in
-                sign_in_button = self.driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
-                sign_in_button.click()
-                
-                # Wait for login
-                time.sleep(5)
-                
                 current_url = self.driver.current_url
-                if 'feed' in current_url or 'in/' in current_url:
-                    logger.info(f"✅ Login successful - on: {current_url}")
+                logger.info(f"📍 Current URL: {current_url}")
+                
+                # Parse URL to get path without query params
+                from urllib.parse import urlparse
+                parsed = urlparse(current_url)
+                path = parsed.path
+                
+                # Check if successfully on feed (strict check)
+                if path.startswith('/feed'):
+                    logger.info(f"✅ Already logged in! On feed page")
                     self.is_logged_in = True
-                elif 'checkpoint' in current_url or 'challenge' in current_url:
-                    logger.warning("⚠️  Verification challenge detected - may need manual intervention")
-                    # Raise exception so the async wrapper can handle it
-                    raise Exception("LinkedIn security challenge detected during login")
+                    
+                # Check if on login/auth pages
+                elif 'authwall' in current_url or 'signup' in current_url or '/uas/login' in current_url or path == '/login':
+                    logger.info(f"🔑 On login/auth page, need to authenticate")
+                    
+                    # Check if this is a re-authentication page (email prefilled, password required)
+                    try:
+                        password_field = self.driver.find_element(By.ID, "password")
+                        if password_field:
+                            logger.info("🔐 Re-authentication page detected (password field found)")
+                            
+                            # Check if email is already filled
+                            try:
+                                email_field = self.driver.find_element(By.ID, "username")
+                                email_value = email_field.get_attribute('value')
+                                if email_value:
+                                    logger.info(f"✅ Email already filled: {email_value}")
+                                else:
+                                    logger.info("📝 Filling email...")
+                                    email_field.clear()
+                                    email_field.send_keys(self.email)
+                            except NoSuchElementException:
+                                logger.info("ℹ️  No email field (may already be authenticated)")
+                            
+                            # Fill password
+                            logger.info("🔐 Filling password...")
+                            password_field.clear()
+                            password_field.send_keys(self.password)
+                            
+                            # Click sign in
+                            sign_in_button = self.driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+                            sign_in_button.click()
+                            logger.info("✅ Clicked sign in button")
+                            
+                            # Wait for login
+                            time.sleep(5)
+                            
+                            current_url = self.driver.current_url
+                            parsed = urlparse(current_url)
+                            path = parsed.path
+                            
+                            if path.startswith('/feed'):
+                                logger.info(f"✅ Re-authentication successful!")
+                                self.is_logged_in = True
+                                self._save_cookies()
+                            elif 'checkpoint' in current_url or 'challenge' in current_url:
+                                logger.warning("⚠️  Verification challenge detected")
+                                raise Exception("LinkedIn security challenge detected during login")
+                            else:
+                                logger.warning(f"⚠️  Unexpected URL after re-auth: {current_url}")
+                                self.is_logged_in = True  # Try anyway
+                                self._save_cookies()
+                    
+                    except NoSuchElementException:
+                        # No password field, this is a fresh login page
+                        logger.info("🔑 Fresh login page, proceeding with full login...")
+                        self.driver.get("https://www.linkedin.com/login")
+                        time.sleep(3)
+                        
+                        # Fill email
+                        email_field = WebDriverWait(self.driver, 10).until(
+                            EC.presence_of_element_located((By.ID, "username"))
+                        )
+                        email_field.send_keys(self.email)
+                        
+                        # Fill password
+                        password_field = self.driver.find_element(By.ID, "password")
+                        password_field.send_keys(self.password)
+                        
+                        # Click sign in
+                        sign_in_button = self.driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+                        sign_in_button.click()
+                        
+                        # Wait for login
+                        time.sleep(5)
+                        
+                        current_url = self.driver.current_url
+                        parsed = urlparse(current_url)
+                        path = parsed.path
+                        
+                        if path.startswith('/feed'):
+                            logger.info(f"✅ Login successful!")
+                            self.is_logged_in = True
+                            self._save_cookies()
+                        elif 'checkpoint' in current_url or 'challenge' in current_url:
+                            logger.warning("⚠️  Verification challenge detected")
+                            raise Exception("LinkedIn security challenge detected during login")
+                        else:
+                            logger.warning(f"⚠️  Unexpected URL after login: {current_url}")
+                            self.is_logged_in = True  # Try anyway
+                            self._save_cookies()
+                        
                 else:
-                    logger.warning(f"⚠️  Unexpected URL after login: {current_url}")
-                    self.is_logged_in = True  # Try anyway
+                    logger.warning(f"⚠️  Unexpected URL: {current_url}")
+                    self.is_logged_in = True  # Assume logged in if not on known auth pages
             
             return True
             
@@ -643,16 +766,76 @@ Alternative: Connect via VNC client to localhost:5900
             if not self.is_logged_in:
                 raise Exception("Not logged in")
             
-            # Construct profile URL - support company pages with company/ prefix
+            # FIRST: Visit main profile page to extract author name
+            author_name = handle.replace('-', ' ').replace('company/', '').title()  # Default fallback
+            
+            if handle.startswith("company/"):
+                company_handle = handle.replace("company/", "")
+                name_page_url = f"https://www.linkedin.com/company/{company_handle}/"
+                logger.info(f"📝 Visiting company page to get name: {company_handle}...")
+            else:
+                name_page_url = f"https://www.linkedin.com/in/{handle}/"
+                logger.info(f"📝 Visiting profile page to get name: {handle}...")
+            
+            self.driver.get(name_page_url)
+            time.sleep(3)
+            
+            # Extract name from profile page
+            from bs4 import BeautifulSoup
+            name_page_html = self.driver.page_source
+            name_soup = BeautifulSoup(name_page_html, 'html.parser')
+            
+            # Try multiple strategies to find the name
+            extracted_name = None
+            
+            # Strategy 1: Look for h1 with the person's name
+            name_header = name_soup.find('h1', class_=lambda c: c and 'text-heading-xlarge' in str(c))
+            if name_header:
+                extracted_name = name_header.get_text(strip=True)
+                logger.debug("Found name in h1 with text-heading-xlarge")
+            
+            # Strategy 2: Look for h1 with top-card class (common on profiles)
+            if not extracted_name:
+                name_header = name_soup.find('h1', class_=lambda c: c and 'top-card' in str(c))
+                if name_header:
+                    extracted_name = name_header.get_text(strip=True)
+                    logger.debug("Found name in h1 with top-card")
+            
+            # Strategy 3: Look in page title (fallback)
+            if not extracted_name:
+                title = name_soup.find('title')
+                if title:
+                    title_text = title.get_text()
+                    # Title format: "(X) Name | LinkedIn" or "Name | LinkedIn"
+                    if '|' in title_text:
+                        parts = title_text.split('|')
+                        if len(parts) >= 2:
+                            name_part = parts[0].strip()
+                            # Remove notification count like "(24)"
+                            import re
+                            name_part = re.sub(r'^\(\d+\)\s*', '', name_part)
+                            # Remove trailing text like "Activity" or "Posts"
+                            name_part = re.sub(r'\s+(Activity|Posts|Profile)$', '', name_part)
+                            if name_part and len(name_part) > 3:
+                                extracted_name = name_part
+                                logger.debug(f"Found name in title: {extracted_name}")
+            
+            if extracted_name and len(extracted_name) > 3:
+                author_name = extracted_name
+                logger.info(f"✅ Extracted author name: {author_name}")
+            else:
+                logger.warning(f"⚠️  Could not find name on profile page, using fallback: {author_name}")
+            
+            # NOW: Navigate to posts/activity page
             if handle.startswith("company/"):
                 # Company page format: /company/{handle}/posts/
                 company_handle = handle.replace("company/", "")
                 profile_url = f"https://www.linkedin.com/company/{company_handle}/posts/"
-                logger.info(f"🏢 Navigating to company page: {company_handle}...")
+                logger.info(f"🏢 Navigating to company posts: {company_handle}...")
             else:
                 # Personal profile format: /in/{handle}/recent-activity/all/
                 profile_url = f"https://www.linkedin.com/in/{handle}/recent-activity/all/"
-                logger.info(f"🔍 Navigating to {handle}'s profile...")
+                logger.info(f"🔍 Navigating to recent activity: {handle}...")
             
             self.driver.get(profile_url)
             
@@ -687,6 +870,8 @@ Alternative: Connect via VNC client to localhost:5900
             # Parse with BeautifulSoup outside the Selenium context
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(page_html, 'html.parser')
+            
+            # Note: author_name was already extracted from the main profile page above
             
             # STRATEGY 1: Find posts by "Feed post number X" headers
             post_headers = soup.find_all('h2', class_='visually-hidden', string=lambda s: s and 'Feed post number' in s)
@@ -747,33 +932,6 @@ Alternative: Connect via VNC client to localhost:5900
                         logger.debug(f"⚠️  Skipping post {idx+1} - no substantial content")
                         continue
                     
-                    # Extract author name from the profile page or post metadata
-                    # Default to formatted handle if we can't find the name
-                    author_name = handle.replace('-', ' ').replace('company/', '').title()
-                    
-                    # Strategy 1: Look for profile name in the page header (h1)
-                    name_header = soup.find('h1', class_=lambda c: c and 'text-heading-xlarge' in c)
-                    if not name_header:
-                        # Alternative: try company name
-                        name_header = soup.find('h1', class_=lambda c: c and ('org-top-card' in str(c) or 'org-name' in str(c)))
-                    
-                    if name_header:
-                        extracted_name = name_header.get_text(strip=True)
-                        if extracted_name and len(extracted_name) > 3:  # Minimum length check
-                            author_name = extracted_name
-                            logger.debug(f"   📝 Extracted author name from header: {author_name}")
-                    else:
-                        # Strategy 2: Look for the author name in the post metadata
-                        # Posts usually have the author name in a span or link near the top
-                        author_link = soup.find('a', class_=lambda c: c and 'app-aware-link' in c)
-                        if author_link:
-                            potential_name = author_link.get_text(strip=True)
-                            if potential_name and len(potential_name) > 3 and potential_name.lower() != handle.lower():
-                                author_name = potential_name
-                                logger.debug(f"   📝 Extracted author name from link: {author_name}")
-                        else:
-                            logger.debug(f"   📝 Using formatted handle as name: {author_name}")
-                    
                     # EXTRACT UNIQUE POST URL - Look for activity URN
                     post_url = None
                     
@@ -799,17 +957,75 @@ Alternative: Connect via VNC client to localhost:5900
                         post_url = f"{profile_url}#post-{timestamp}-{idx}"
                         logger.warning(f"⚠️  Could not find unique activity ID for post {idx+1}, using fallback URL")
                     
+                    # EXTRACT POST DATE - Look for relative time text
+                    logger.info(f"   🕐 Starting date extraction for post {idx+1}")
+                    post_date = datetime.utcnow()  # Default fallback
+                    
+                    # Strategy 1: Look for visually-hidden span with "X days ago"
+                    # Find all visually-hidden spans and check their text
+                    time_spans = post_element.find_all('span', class_='visually-hidden')
+                    time_text_found = None
+                    logger.info(f"   🔎 Found {len(time_spans)} visually-hidden spans in post {idx+1}")
+                    for span in time_spans:
+                        text = span.get_text(strip=True)
+                        if text and 'ago' in text.lower():
+                            logger.info(f"     ✅ Found time span: '{text[:50]}'")
+                            # Parse text like "1 day ago • Visible to anyone..." 
+                            if '•' in text:
+                                text = text.split('•')[0].strip()
+                            time_text_found = text
+                            break
+                    
+                    if time_text_found:
+                        post_date = self._parse_relative_time(time_text_found)
+                        logger.info(f"   📅 Parsed post date: {time_text_found} → {post_date}")
+                    else:
+                        logger.info(f"   ⚠️  No 'ago' text found in {len(time_spans)} visually-hidden spans for post {idx+1}")
+                        # Strategy 2: Look for time element or datetime attribute
+                        time_elem = post_element.find('time')
+                        if time_elem:
+                            # Check for datetime attribute (absolute time)
+                            datetime_attr = time_elem.get('datetime')
+                            if datetime_attr:
+                                try:
+                                    post_date = datetime.fromisoformat(datetime_attr.replace('Z', '+00:00'))
+                                    logger.info(f"   📅 Parsed from time element datetime attr: {datetime_attr} → {post_date}")
+                                except Exception as e:
+                                    logger.info(f"   Failed to parse datetime attr: {e}")
+                            else:
+                                # Parse relative text from time element
+                                time_text = time_elem.get_text(strip=True)
+                                if time_text:
+                                    post_date = self._parse_relative_time(time_text)
+                                    logger.info(f"   📅 Parsed from time element text: {time_text} → {post_date}")
+                    
+                    # Check if post is within the cutoff date (skip if too old)
+                    if post_date < cutoff_date:
+                        age_days = (datetime.utcnow() - post_date).days
+                        logger.info(f"⏭️  Skipping post {idx+1} - too old ({age_days} days)")
+                        continue
+                    
                     post = LinkedInPost(
                         url=post_url,
                         author_handle=handle,
                         author_name=author_name,
                         content=content.strip(),
-                        post_date=datetime.utcnow()
+                        post_date=post_date
                     )
                     
                     posts.append(post)
-                    logger.info(f"✅ Scraped post {idx+1}: {content[:80]}...")
+                    age_days = (datetime.utcnow() - post_date).days
+                    logger.info(f"✅ Scraped post {idx+1} ({age_days} days old): {content[:80]}...")
                     logger.debug(f"   URL: {post_url}")
+                    
+                    # Auto-like post if enabled
+                    from app.config import get_settings
+                    settings = get_settings()
+                    if settings.auto_like_posts and post_url and post_url.startswith('http'):
+                        try:
+                            self._like_post(post_url)
+                        except Exception as like_error:
+                            logger.warning(f"⚠️  Failed to like post: {like_error}")
                     
                 except Exception as e:
                     logger.warning(f"⚠️  Failed to extract post {idx+1}: {e}")
@@ -876,6 +1092,123 @@ Alternative: Connect via VNC client to localhost:5900
             
             log_operation_error(logger, "selenium_scrape_posts", e)
             raise
+    
+    def _parse_relative_time(self, time_text: str) -> datetime:
+        """Parse relative time text (e.g. '2 days ago') to datetime."""
+        now = datetime.utcnow()
+        time_text = time_text.lower().strip()
+        
+        logger.info(f"      🔧 Parsing '{time_text}', now={now}")
+        
+        try:
+            # Extract the number from the text
+            import re
+            numbers = re.findall(r'\d+', time_text)
+            if not numbers:
+                logger.info(f"      ⚠️  No numbers found in '{time_text}'")
+                return now
+            
+            num = int(numbers[0])
+            logger.info(f"      🔢 Extracted number: {num}")
+            
+            # Determine the time unit
+            # NOTE: Check longer/more specific patterns first to avoid false matches
+            # e.g. "month" contains 'h' so must check before 'hour'
+            if 'month' in time_text or 'mo' in time_text:
+                result = now - timedelta(days=num * 30)
+                logger.info(f"      ⏱️  Unit: months, result={result}")
+                return result
+            elif 'year' in time_text or 'yr' in time_text:
+                result = now - timedelta(days=num * 365)
+                logger.info(f"      ⏱️  Unit: years, result={result}")
+                return result
+            elif 'week' in time_text or 'wk' in time_text:
+                result = now - timedelta(weeks=num)
+                logger.info(f"      ⏱️  Unit: weeks, result={result}")
+                return result
+            elif 'day' in time_text:
+                result = now - timedelta(days=num)
+                logger.info(f"      ⏱️  Unit: days, result={result}")
+                return result
+            elif 'hour' in time_text or 'hr' in time_text:
+                result = now - timedelta(hours=num)
+                logger.info(f"      ⏱️  Unit: hours, result={result}")
+                return result
+            elif 'minute' in time_text or 'min' in time_text:
+                result = now - timedelta(minutes=num)
+                logger.info(f"      ⏱️  Unit: minutes, result={result}")
+                return result
+            elif 'second' in time_text or 'sec' in time_text:
+                result = now - timedelta(seconds=num)
+                logger.info(f"      ⏱️  Unit: seconds, result={result}")
+                return result
+            else:
+                logger.info(f"      ⚠️  No time unit matched in '{time_text}'")
+        except Exception as e:
+            logger.info(f"      ❌ Failed to parse relative time '{time_text}': {e}")
+        
+        logger.info(f"      🔙 Returning fallback: {now}")
+        return now
+    
+    def _like_post(self, post_url: str) -> bool:
+        """
+        Navigate to a post and like it.
+        
+        Args:
+            post_url: URL of the post to like
+            
+        Returns:
+            True if successfully liked, False otherwise
+        """
+        try:
+            # Navigate to the post
+            self.driver.get(post_url)
+            time.sleep(2)
+            
+            # Find the like button - LinkedIn uses various selectors
+            # Try multiple strategies
+            like_button = None
+            
+            # Strategy 1: Look for button with aria-label="Like"
+            try:
+                like_button = self.driver.find_element(By.CSS_SELECTOR, 'button[aria-label="Like"]')
+            except:
+                pass
+            
+            # Strategy 2: Look for button with aria-label containing "React"
+            if not like_button:
+                try:
+                    like_button = self.driver.find_element(By.CSS_SELECTOR, 'button[aria-label*="React"]')
+                except:
+                    pass
+            
+            # Strategy 3: Look for button with class containing "reactions-react-button"
+            if not like_button:
+                try:
+                    like_button = self.driver.find_element(By.CSS_SELECTOR, 'button.reactions-react-button')
+                except:
+                    pass
+            
+            if not like_button:
+                logger.warning(f"⚠️  Could not find like button for post: {post_url}")
+                return False
+            
+            # Check if already liked (aria-pressed="true" or specific class)
+            is_liked = like_button.get_attribute('aria-pressed') == 'true'
+            if is_liked:
+                logger.debug(f"✓ Post already liked: {post_url}")
+                return True
+            
+            # Click the like button
+            like_button.click()
+            time.sleep(1)
+            
+            logger.info(f"👍 Liked post: {post_url}")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"⚠️  Failed to like post {post_url}: {e}")
+            return False
     
     def _find_post_by_content(
         self,

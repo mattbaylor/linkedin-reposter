@@ -281,7 +281,7 @@ async def scheduled_scrape_and_process():
                 
                 try:
                     # Scrape each handle
-                    for handle in handles:
+                    for idx, handle in enumerate(handles):
                         handle = handle.strip()
                         logger.info(f"📥 Scraping @{handle}...")
                         
@@ -403,7 +403,11 @@ async def scheduled_scrape_and_process():
                         except Exception as e:
                             logger.error(f"❌ Failed to scrape @{handle}: {e}")
                             total_failed += 1
-                            continue
+                        
+                        # Add human-like delay between profiles (except after last one)
+                        if idx < len(handles) - 1:
+                            from app.utils import random_profile_delay
+                            random_profile_delay()
                 
                 finally:
                     # Stop browser after all handles
@@ -471,19 +475,27 @@ async def lifespan(app: FastAPI):
         replace_existing=True
     )
     
-    # Scrape LinkedIn posts at 11am and 4pm MST/MDT
+    # Scrape LinkedIn posts at 5:30am and 1:00pm MST/MDT
+    # Note: Using two separate schedules since times have different minutes
     scheduler_instance.add_job(
         func=lambda: asyncio.create_task(scheduled_scrape_and_process()),
-        trigger=CronTrigger(hour='11,16', minute='0', timezone='America/Denver'),
-        id='scheduled_scrape',
-        name='Scrape LinkedIn posts and send for approval',
+        trigger=CronTrigger(hour='5', minute='30', timezone='America/Denver'),
+        id='scheduled_scrape_morning',
+        name='Scrape LinkedIn posts (morning)',
+        replace_existing=True
+    )
+    scheduler_instance.add_job(
+        func=lambda: asyncio.create_task(scheduled_scrape_and_process()),
+        trigger=CronTrigger(hour='13', minute='0', timezone='America/Denver'),
+        id='scheduled_scrape_afternoon',
+        name='Scrape LinkedIn posts (afternoon)',
         replace_existing=True
     )
     
     scheduler_instance.start()
     logger.info("✅ Background scheduler started")
     logger.info("   📅 Publishing check: Every 5 minutes")
-    logger.info("   📅 Scraping schedule: 11:00 AM and 4:00 PM MST/MDT")
+    logger.info("   📅 Scraping schedule: 5:30 AM and 1:00 PM MST/MDT")
     
     yield
     
@@ -708,6 +720,46 @@ async def admin_dashboard(
         'rejected': rejected
     }
     
+    # Get unique authors for dropdown
+    authors_result = await db.execute(
+        select(LinkedInPost.author_name, LinkedInPost.author_handle)
+        .distinct()
+        .order_by(LinkedInPost.author_name)
+    )
+    unique_authors = [
+        {'name': row[0], 'handle': row[1]} 
+        for row in authors_result.all()
+    ]
+    
+    # Get scheduled posts (upcoming posts ordered by scheduled time)
+    from app.models import ScheduledPost
+    scheduled_result = await db.execute(
+        select(ScheduledPost)
+        .options(
+            selectinload(ScheduledPost.post),
+            selectinload(ScheduledPost.variant)
+        )
+        .where(ScheduledPost.status == ScheduledPostStatus.PENDING)
+        .order_by(ScheduledPost.scheduled_for.asc())
+    )
+    scheduled_posts = scheduled_result.scalars().all()
+    
+    # Convert scheduled posts to dict
+    schedule_data = []
+    for sched in scheduled_posts:
+        schedule_data.append({
+            'id': sched.id,
+            'post_id': sched.post_id,
+            'author_name': sched.post.author_name,
+            'author_handle': sched.post.author_handle,
+            'original_content': sched.post.original_content[:100] + '...' if len(sched.post.original_content) > 100 else sched.post.original_content,
+            'variant_content': sched.variant.variant_content[:100] + '...' if len(sched.variant.variant_content) > 100 else sched.variant.variant_content,
+            'scheduled_for': sched.scheduled_for.strftime('%Y-%m-%d %H:%M'),
+            'approved_at': sched.approved_at.strftime('%Y-%m-%d %H:%M'),
+            'priority_level': sched.priority_level or 'NORMAL',
+            'post_age_hours': sched.post_age_hours
+        })
+    
     # Convert posts to dict
     posts_data = []
     for post in posts:
@@ -725,11 +777,11 @@ async def admin_dashboard(
             'author_handle': post.author_handle,
             'original_content': post.original_content,
             'status': post.status.value,
-            'scraped_at': post.scraped_at.strftime('%Y-%m-%d %H:%M'),
+            'post_date': post.original_post_date.strftime('%Y-%m-%d %H:%M') if post.original_post_date else post.scraped_at.strftime('%Y-%m-%d %H:%M'),
             'variants': variants_data
         })
     
-    html = get_dashboard_html(posts_data, stats, settings, current_status=status, current_author=author)
+    html = get_dashboard_html(posts_data, stats, settings, current_status=status, current_author=author, authors=unique_authors, schedule=schedule_data)
     return HTMLResponse(content=html)
 
 
@@ -769,15 +821,12 @@ async def admin_approve_variant(
         else:
             v.status = VariantStatus.REJECTED
     
-    # Create scheduled post (post in 1 hour)
-    scheduled_time = datetime.utcnow() + timedelta(hours=1)
-    scheduled_post = ScheduledPost(
-        post_id=post.id,
-        variant_id=variant_id,
-        scheduled_for=scheduled_time,
-        status=ScheduledPostStatus.PENDING
-    )
-    db.add(scheduled_post)
+    # Use intelligent scheduler to find optimal posting time
+    scheduler = get_scheduler()
+    scheduled_time = await scheduler.assign_publish_slot(db, post.id, variant_id)
+    
+    # Automatically scrub schedule to fix any conflicts
+    await scrub_schedule_internal(db)
     
     await db.commit()
     
@@ -919,6 +968,32 @@ async def admin_delete_post(
     return {"success": True, "message": "Post deleted"}
 
 
+@app.delete("/admin/scheduled/{scheduled_post_id}")
+async def admin_delete_scheduled_post(
+    scheduled_post_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Remove a post from the schedule."""
+    log_operation_start(logger, "admin_delete_scheduled_post", scheduled_post_id=scheduled_post_id)
+    
+    # Get the scheduled post
+    result = await db.execute(
+        select(ScheduledPost).where(ScheduledPost.id == scheduled_post_id)
+    )
+    scheduled_post = result.scalar_one_or_none()
+    
+    if not scheduled_post:
+        raise HTTPException(status_code=404, detail="Scheduled post not found")
+    
+    # Delete the scheduled post (but keep the original post and variants)
+    await db.delete(scheduled_post)
+    await db.commit()
+    
+    log_operation_success(logger, "admin_delete_scheduled_post", scheduled_post_id=scheduled_post_id)
+    
+    return {"success": True, "message": "Removed from schedule"}
+
+
 @app.post("/admin/trigger-scrape")
 async def admin_trigger_scrape(db: AsyncSession = Depends(get_db)):
     """Manually trigger a scrape of all monitored LinkedIn handles."""
@@ -931,7 +1006,129 @@ async def admin_trigger_scrape(db: AsyncSession = Depends(get_db)):
     
     return {
         "success": True,
-        "message": "Scrape started! Check the dashboard in a few minutes for new posts."
+        "message": "Scraping started in background"
+    }
+
+
+async def scrub_schedule_internal(db: AsyncSession):
+    """
+    Internal function to scrub the schedule (called automatically after approvals).
+    Fixes conflicts:
+    1. Remove duplicate scheduled posts (same post_id)
+    2. Reorder by priority (URGENT > GOOD > OK > STALE)
+    3. Fix spacing violations (< 90 min between posts)
+    4. Respect posting hours and weekends
+    """
+    from datetime import timedelta, datetime
+    from sqlalchemy import delete
+    
+    # Get all pending scheduled posts
+    result = await db.execute(
+        select(ScheduledPost)
+        .where(ScheduledPost.status == ScheduledPostStatus.PENDING)
+        .order_by(ScheduledPost.scheduled_for)
+    )
+    scheduled_posts = list(result.scalars().all())
+    
+    if not scheduled_posts:
+        return
+    
+    changes = []
+    
+    # Step 1: Find and remove duplicates (keep the first one scheduled)
+    seen_post_ids = set()
+    duplicates_to_delete = []
+    
+    for post in scheduled_posts:
+        if post.post_id in seen_post_ids:
+            duplicates_to_delete.append(post.id)
+            logger.info(f"Removing duplicate: Post {post.post_id} scheduled for {post.scheduled_for}")
+        else:
+            seen_post_ids.add(post.post_id)
+    
+    # Delete duplicates
+    if duplicates_to_delete:
+        await db.execute(
+            delete(ScheduledPost).where(ScheduledPost.id.in_(duplicates_to_delete))
+        )
+        await db.commit()
+        logger.info(f"Deleted {len(duplicates_to_delete)} duplicate scheduled posts")
+    
+    # Step 2: Re-fetch remaining posts
+    result = await db.execute(
+        select(ScheduledPost)
+        .where(ScheduledPost.status == ScheduledPostStatus.PENDING)
+        .order_by(ScheduledPost.scheduled_for)
+    )
+    scheduled_posts = list(result.scalars().all())
+    
+    if not scheduled_posts:
+        await db.commit()
+        return
+    
+    # Step 3: Sort by priority (URGENT > GOOD > OK > STALE > None)
+    priority_order = {'URGENT': 0, 'GOOD': 1, 'OK': 2, 'STALE': 3, None: 4}
+    scheduled_posts.sort(key=lambda p: (priority_order.get(p.priority_level, 4), p.scheduled_for))
+    
+    # Get scheduler settings
+    scheduler = get_scheduler()
+    min_spacing = scheduler.min_spacing_minutes
+    
+    # Step 4: Reschedule all posts with proper spacing and priority order
+    # Start from the earliest currently scheduled time or now (whichever is later)
+    earliest_time = min(p.scheduled_for for p in scheduled_posts)
+    start_time = max(earliest_time, datetime.now())
+    
+    current_time = scheduler._normalize_to_posting_hours(start_time)
+    
+    for post in scheduled_posts:
+        old_time = post.scheduled_for
+        
+        # Find next valid slot
+        iteration = 0
+        while iteration < 365:
+            iteration += 1
+            
+            # Skip weekends if configured
+            if scheduler.posting_weekdays_only and current_time.weekday() in [5, 6]:
+                current_time = scheduler._move_to_next_weekday(current_time)
+                continue
+            
+            # Check if within posting hours
+            current_time = scheduler._normalize_to_posting_hours(current_time)
+            
+            # Valid slot found
+            break
+        
+        # Assign new time
+        post.scheduled_for = current_time
+        
+        if old_time != current_time:
+            logger.info(
+                f"Reordered {post.priority_level or 'N/A'}: Post {post.post_id} "
+                f"moved from {old_time.strftime('%b %d %I:%M %p')} to "
+                f"{current_time.strftime('%b %d %I:%M %p')}"
+            )
+        
+        # Move to next slot with minimum spacing
+        current_time = current_time + timedelta(minutes=min_spacing)
+    
+    await db.commit()
+    logger.info("Schedule scrubbed automatically")
+
+
+@app.post("/admin/scrub-schedule")
+async def admin_scrub_schedule(db: AsyncSession = Depends(get_db)):
+    """Manually scrub the schedule to fix conflicts."""
+    log_operation_start(logger, "admin_scrub_schedule")
+    
+    await scrub_schedule_internal(db)
+    
+    log_operation_success(logger, "admin_scrub_schedule")
+    
+    return {
+        "success": True,
+        "message": "Schedule scrubbed successfully"
     }
 
 

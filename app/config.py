@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     # Scraping configuration
     scraping_lookback_days: int = 7
     scraping_max_posts_per_handle: int = 50
+    auto_like_posts: bool = True  # Auto-like original posts during scraping
     
     # Posting intelligence configuration
     daily_post_limit: int = 3

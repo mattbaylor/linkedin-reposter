@@ -1,7 +1,43 @@
 """Admin dashboard HTML templates and helpers."""
 
-def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: str = None, current_author: str = None) -> str:
+def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: str = None, current_author: str = None, authors: list = None, schedule: list = None) -> str:
     """Generate admin dashboard HTML."""
+    
+    # Build author dropdown options
+    authors_options = ""
+    if authors:
+        for author in authors:
+            selected = 'selected' if current_author == author['handle'] else ''
+            authors_options += f'<option value="{author["handle"]}" {selected}>{author["name"]}</option>\n'
+    
+    # Build schedule HTML
+    schedule_html = ""
+    if schedule and len(schedule) > 0:
+        for sched in schedule:
+            priority_color = {
+                'URGENT': '#dc3545',
+                'GOOD': '#28a745',
+                'OK': '#ffc107',
+                'STALE': '#6c757d',
+                'NORMAL': '#17a2b8'
+            }.get(sched.get('priority_level', 'NORMAL'), '#17a2b8')
+            
+            schedule_html += f"""
+            <tr>
+                <td>{sched['scheduled_for']}</td>
+                <td><strong>{sched['author_name']}</strong></td>
+                <td class="schedule-content">{sched['variant_content']}</td>
+                <td><span class="badge" style="background-color: {priority_color}">{sched.get('priority_level', 'NORMAL')}</span></td>
+                <td>{sched['approved_at']}</td>
+                <td>
+                    <button onclick="deleteScheduledPost({sched['id']})" class="btn btn-danger btn-sm" title="Remove from schedule">
+                        🗑️
+                    </button>
+                </td>
+            </tr>
+            """
+    else:
+        schedule_html = '<tr><td colspan="6" style="text-align: center; padding: 20px; color: #999;">No posts scheduled yet</td></tr>'
     
     # Build posts HTML
     posts_html = ""
@@ -41,7 +77,7 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
             <div class="post-header">
                 <div class="post-meta">
                     <strong>{post['author_name']}</strong> (@{post['author_handle']})
-                    <span class="post-date">{post['scraped_at']}</span>
+                    <span class="post-date">{post['post_date']}</span>
                 </div>
                 <span class="badge status-{post['status'].replace('_', '-')}" style="background-color: {status_color}">
                     {post['status'].replace('_', ' ').title()}
@@ -348,6 +384,26 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                 padding: 20px;
                 color: #666;
             }}
+            
+            .schedule-content {{
+                max-width: 400px;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }}
+            
+            table tbody tr {{
+                border-bottom: 1px solid #e9ecef;
+            }}
+            
+            table tbody tr:hover {{
+                background: #f8f9fa;
+            }}
+            
+            table td {{
+                padding: 12px;
+                vertical-align: top;
+            }}
         </style>
     </head>
     <body>
@@ -401,11 +457,33 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                     Author:
                     <select id="authorFilter" onchange="filterPosts()">
                         <option value="">All Authors</option>
+                        {authors_options}
                     </select>
                 </label>
                 <button onclick="triggerScrape()" class="btn btn-primary btn-sm">🔍 Scrape Now</button>
                 <button onclick="regenerateAllMissing()" class="btn btn-primary btn-sm">🤖 Generate Missing Variants</button>
                 <button onclick="window.location.reload()" class="btn btn-primary btn-sm">🔄 Refresh</button>
+            </div>
+            
+            <div class="post-card" style="margin-bottom: 30px;">
+                <h2 style="margin-bottom: 15px;">📅 Posting Schedule ({len(schedule) if schedule else 0} pending)</h2>
+                <div style="overflow-x: auto;">
+                    <table style="width: 100%; border-collapse: collapse;">
+                        <thead>
+                            <tr style="background: #f8f9fa; border-bottom: 2px solid #dee2e6;">
+                                <th style="padding: 12px; text-align: left; font-weight: 600;">Scheduled For</th>
+                                <th style="padding: 12px; text-align: left; font-weight: 600;">Author</th>
+                                <th style="padding: 12px; text-align: left; font-weight: 600;">Variant Content</th>
+                                <th style="padding: 12px; text-align: left; font-weight: 600;">Priority</th>
+                                <th style="padding: 12px; text-align: left; font-weight: 600;">Approved At</th>
+                                <th style="padding: 12px; text-align: left; font-weight: 600;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {schedule_html}
+                        </tbody>
+                    </table>
+                </div>
             </div>
             
             <div id="posts-container">
@@ -488,6 +566,26 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                     
                     if (response.ok) {{
                         alert('✅ Post deleted');
+                        window.location.reload();
+                    }} else {{
+                        const error = await response.json();
+                        alert('❌ Error: ' + (error.detail || 'Failed to delete'));
+                    }}
+                }} catch (err) {{
+                    alert('❌ Network error: ' + err.message);
+                }}
+            }}
+            
+            async function deleteScheduledPost(scheduledPostId) {{
+                if (!confirm('Remove this post from the schedule? The post and variants will remain in the system.')) return;
+                
+                try {{
+                    const response = await fetch(`/admin/scheduled/${{scheduledPostId}}`, {{
+                        method: 'DELETE'
+                    }});
+                    
+                    if (response.ok) {{
+                        alert('✅ Removed from schedule');
                         window.location.reload();
                     }} else {{
                         const error = await response.json();

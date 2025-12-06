@@ -10,7 +10,10 @@ Automated LinkedIn post monitoring and reposting service with AI-powered content
 - 📧 Email approval workflow via Postal (optional - dashboard preferred)
 - 🔐 Secure secret management with **Infisical Machine Identity** (auto-updating tokens)
 - 🖥️ **Web-based VNC** for LinkedIn manual authentication and CAPTCHA solving
-- ⏰ Scheduled monitoring (11am & 4pm MST/MDT)
+- ⏰ Scheduled monitoring (5:30am & 1:00pm MST/MDT)
+- 🎯 **Smart Scheduling** - Priority-based queue (URGENT > GOOD > OK > STALE) with automatic conflict resolution
+- 🗑️ **Schedule Management** - Delete scheduled posts, auto-scrub conflicts, and manual schedule regeneration
+- 🤖 **Human-like Scraping** - Random 1-3 minute delays between profiles to avoid detection
 - 🐳 Fully containerized with Docker
 - 🏗️ Multi-architecture support (arm64 + amd64) via GitHub Actions
 
@@ -137,6 +140,10 @@ open http://localhost:8080/admin
 - Approve posts with one click
 - Regenerate variants using AI
 - Monitor publishing schedule
+- **Delete scheduled posts** with one click
+- **Priority-based scheduling** - Posts automatically ordered by priority (URGENT, GOOD, OK, STALE)
+- **Automatic conflict resolution** - Schedule auto-scrubs after approvals to fix spacing/priority issues
+- **Manual schedule regeneration** - Trigger full schedule rebuild via admin button
 
 **VNC Access** (for LinkedIn manual auth):
 - URL: `http://localhost:6080/vnc.html`
@@ -194,6 +201,9 @@ python -m uvicorn app.main:app --reload --port 8080
 - `POST /admin/approve/{post_id}/{variant_number}` - Approve a variant
 - `POST /admin/reject/{post_id}` - Reject all variants
 - `POST /admin/regenerate/{post_id}` - Regenerate variants with AI
+- `DELETE /admin/scheduled/{scheduled_post_id}` - Delete a scheduled post
+- `POST /admin/scrub-schedule` - Manually trigger schedule conflict resolution
+- `POST /admin/trigger-scrape` - Manually trigger LinkedIn scraping
 
 ### Email Approval (Legacy - Dashboard Preferred)
 - `GET /approve?id=<post_id>&variant=<1-3>&token=<token>` - Approve a post
@@ -266,6 +276,60 @@ All application secrets are stored securely in Infisical and fetched at runtime.
 5. Variants optimized for LinkedIn engagement
 
 See `GITHUB_COPILOT_SETUP.md` for detailed integration documentation.
+
+## Smart Scheduling System
+
+The LinkedIn Reposter includes an intelligent scheduling system that automatically manages your posting queue:
+
+### Priority Levels
+Posts are categorized into 4 priority levels based on their age:
+- **URGENT** (0-2 days old) - Jumps to front of queue, can bump lower-priority posts
+- **GOOD** (2-4 days old) - High priority scheduling
+- **OK** (4-6 days old) - Normal priority
+- **STALE** (6+ days old) - Lowest priority, easily bumped by URGENT posts
+
+### Scheduling Rules
+- **Posting Hours**: 6:00 AM - 9:00 PM MST/MDT
+- **Posting Days**: Weekdays only (Monday-Friday)
+- **Spacing**: Minimum 90 minutes between posts
+- **Daily Limit**: Maximum 3 posts per day
+
+### URGENT Post Bumping
+When an URGENT post is approved:
+1. System finds the earliest available slot
+2. If blocked by STALE/OK posts, bumps them to next day
+3. Can exceed daily limit by moving STALE posts
+4. Cascades bumps if conflicts occur
+5. Maintains 90-minute spacing throughout
+
+### Automatic Conflict Resolution
+After every variant approval, the system automatically:
+1. Removes duplicate scheduled posts (same post_id)
+2. Reorders posts by priority (URGENT → GOOD → OK → STALE)
+3. Fixes spacing violations (< 90 min between posts)
+4. Ensures all posts respect posting hours and weekends
+5. Cascades changes to maintain schedule integrity
+
+**Manual Controls:**
+- Delete scheduled posts via dashboard 🗑️ button
+- Trigger manual scrub via "Scrub Schedule" button in admin dashboard
+- Schedule regenerates automatically after each approval
+
+## Human-like Scraping
+
+To avoid LinkedIn bot detection and rate limiting, the scraper implements several humanization techniques:
+
+### Profile Scraping Delays
+- **Between profiles**: Random 1-3 minute delays
+- **Page scrolling**: Random 0.8-2.0 second delays
+- **Typing**: Random 40-70 WPM with occasional hesitations
+- **Navigation**: Random 2-4 second delays after page loads
+
+### Scraping Schedule
+- **Morning scrape**: 5:30 AM MST/MDT
+- **Afternoon scrape**: 1:00 PM MST/MDT
+- Browser session persists to avoid frequent logins
+- Automatic CAPTCHA alerts via email (requires VNC intervention)
 
 ## VNC Remote Access
 
@@ -360,8 +424,11 @@ Contributions welcome! Please open an issue or PR.
 - [x] Phase 7: GitHub Actions multi-arch builds
 - [x] Phase 8: Admin Dashboard with web UI
 - [x] Phase 9: Machine Identity for auto-updating tokens
-- [ ] Phase 10: Production deployment (TrueNAS + Authelia)
-- [ ] Phase 11: Analytics and performance monitoring
+- [x] Phase 10: Smart scheduling with priority-based queue
+- [x] Phase 11: Human-like scraping delays (1-3 min between profiles)
+- [x] Phase 12: Schedule management (delete, auto-scrub, manual regeneration)
+- [ ] Phase 13: Production deployment (TrueNAS + Authelia)
+- [ ] Phase 14: Analytics and performance monitoring
 
 ## Support
 

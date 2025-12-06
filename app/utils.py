@@ -85,6 +85,17 @@ def random_long_delay() -> None:
     random_delay(5.0, 8.0)
 
 
+def random_profile_delay() -> None:
+    """
+    Very long random delay for between-profile scraping (1-3 minutes).
+    Makes scraping behavior appear more human by adding realistic pauses.
+    """
+    delay_seconds = random.uniform(60.0, 180.0)  # 1-3 minutes
+    delay_minutes = delay_seconds / 60
+    logger.info(f"⏳ Human-like delay before next profile: {delay_minutes:.1f} minutes")
+    random_delay(delay_seconds, delay_seconds)
+
+
 def human_typing_delay() -> float:
     """
     Generate a realistic typing delay between characters.
