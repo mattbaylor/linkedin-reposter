@@ -216,7 +216,7 @@ python -m uvicorn app.main:app --reload --port 8080
 ### Local (Mac)
 
 1. Build and run with Docker Compose (see Quick Start)
-2. Configure Caddy to proxy `https://liposter.example.com` → `192.0.2.10:8080`
+2. Configure Caddy to proxy `https://liposter.example.com` → `192.168.1.8:8080`
 
 ### TrueNAS Scale
 
@@ -429,7 +429,7 @@ Contributions welcome! Please open an issue or PR.
 - [x] Phase 10: Smart scheduling with priority-based queue
 - [x] Phase 11: Human-like scraping delays (1-3 min between profiles)
 - [x] Phase 12: Schedule management (delete, auto-scrub, manual regeneration)
-- [ ] Phase 13: Production deployment (TrueNAS + Authelia)
+- [ ] Phase 13: Production deployment
 - [ ] Phase 14: Analytics and performance monitoring
 
 ## Support
