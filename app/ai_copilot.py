@@ -1,4 +1,4 @@
-"""AI service for generating LinkedIn post variants using GitHub Models."""
+"""GitHub Copilot AI service for generating LinkedIn post variants."""
 import logging
 from typing import List, Optional
 import httpx
@@ -8,31 +8,82 @@ from app.logging_config import log_operation_start, log_operation_success, log_o
 logger = logging.getLogger(__name__)
 
 
-class AIService:
+class GitHubCopilotAIService:
     """
-    Service for generating LinkedIn post variants using GitHub Models API.
+    AI service using GitHub Copilot API for higher rate limits.
     
-    Uses the Azure OpenAI-compatible GitHub Models API to generate
-    alternative versions of LinkedIn posts while maintaining the
-    original message and tone.
+    Uses GitHub Copilot's chat completions API with token exchange.
     """
     
-    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
+    def __init__(self, access_token: Optional[str] = None, refresh_token: Optional[str] = None):
         """
-        Initialize the AI service.
+        Initialize the GitHub Copilot AI service.
         
         Args:
-            api_key: GitHub token for API access
-            model: Model name to use (default: gpt-4o)
+            access_token: GitHub Copilot access token (session token)
+            refresh_token: GitHub Copilot refresh token (ghu_ token)
         """
         settings = get_settings()
-        self.api_key = api_key or settings.github_token
-        self.model = model or settings.ai_model
-        self.api_url = "https://models.inference.ai.azure.com/chat/completions"
+        self.session_token = access_token or settings.github_copilot_access_token
+        self.refresh_token = refresh_token or settings.github_copilot_refresh_token
+        self.api_url = "https://api.githubcopilot.com/chat/completions"
+        self.token_url = "https://api.github.com/copilot_internal/v2/token"
+        self.model = "gpt-4o"
+        self.bearer_token = None
         
-        logger.info("🤖 AI Service initialized")
+        if not self.session_token and not self.refresh_token:
+            raise ValueError("GitHub Copilot tokens not configured")
+        
+        logger.info("🤖 GitHub Copilot AI Service initialized")
         logger.info(f"   Model: {self.model}")
-        logger.info(f"   API: GitHub Models (Azure OpenAI compatible)")
+        logger.info(f"   API: GitHub Copilot")
+    
+    async def _get_bearer_token(self) -> str:
+        """
+        Exchange the refresh token for a Copilot API bearer token.
+        
+        The refresh token (ghu_*) can be used to get a time-limited bearer token
+        for the Copilot API.
+        """
+        if self.bearer_token:
+            return self.bearer_token
+        
+        try:
+            # Try to get a bearer token using the refresh token (ghu_* token)
+            if self.refresh_token and self.refresh_token.startswith('ghu_'):
+                logger.info("   Exchanging refresh token for Copilot API bearer token...")
+                
+                headers = {
+                    "Authorization": f"token {self.refresh_token}",
+                    "Accept": "application/json",
+                    "User-Agent": "GitHubCopilotChat/0.11.1"
+                }
+                
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(
+                        self.token_url,
+                        headers=headers,
+                        timeout=30.0
+                    )
+                    
+                    logger.info(f"   Token exchange: {response.status_code}")
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        if 'token' in data:
+                            self.bearer_token = data['token']
+                            logger.info(f"   ✅ Got Copilot API bearer token (expires: {data.get('expires_at', 'unknown')})")
+                            return self.bearer_token
+                    else:
+                        logger.warning(f"   Token exchange failed: {response.text[:200]}")
+            
+            # Fallback: try using session_token as-is
+            logger.info("   Using session token as-is...")
+            return self.session_token
+            
+        except Exception as e:
+            logger.warning(f"   Token exchange error: {e}, using session token")
+            return self.session_token
     
     async def generate_variants(
         self,
@@ -41,7 +92,7 @@ class AIService:
         num_variants: int = 3
     ) -> List[str]:
         """
-        Generate alternative versions of a LinkedIn post.
+        Generate alternative versions of a LinkedIn post using GitHub Copilot.
         
         Args:
             original_content: The original post content
@@ -56,7 +107,7 @@ class AIService:
         """
         log_operation_start(
             logger,
-            "generate_variants",
+            "generate_variants_copilot",
             author=author_name,
             variants_count=num_variants,
             content_length=len(original_content)
@@ -65,9 +116,19 @@ class AIService:
         try:
             prompt = self._create_prompt(original_content, author_name, num_variants)
             
+            # Get a valid bearer token (exchange refresh token if needed)
+            bearer_token = await self._get_bearer_token()
+            
             headers = {
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}"
+                "Authorization": f"Bearer {bearer_token}",
+                "Editor-Version": "vscode/1.85.0",
+                "Editor-Plugin-Version": "copilot-chat/0.11.1",
+                "User-Agent": "GitHubCopilotChat/0.11.1",
+                "Openai-Organization": "github-copilot",
+                "Openai-Intent": "conversation-panel",
+                "VScode-SessionId": "session-001",
+                "VScode-MachineId": "machine-001"
             }
             
             payload = {
@@ -84,11 +145,13 @@ class AIService:
                 ],
                 "temperature": 0.8,
                 "max_tokens": 2000,
-                "top_p": 0.9
+                "top_p": 0.9,
+                "n": 1,
+                "stream": False
             }
             
             async with httpx.AsyncClient() as client:
-                log_api_call(logger, "POST", self.api_url, "GitHub Models API")
+                log_api_call(logger, "POST", self.api_url, "GitHub Copilot API")
                 
                 response = await client.post(
                     self.api_url,
@@ -97,7 +160,7 @@ class AIService:
                     timeout=60.0
                 )
                 
-                logger.info(f"🌐 API POST {self.api_url} → {response.status_code} ")
+                logger.info(f"🌐 API POST {self.api_url} → {response.status_code}")
                 response.raise_for_status()
                 
                 result = response.json()
@@ -119,7 +182,7 @@ class AIService:
                 
                 log_operation_success(
                     logger,
-                    "generate_variants",
+                    "generate_variants_copilot",
                     variants_count=len(variants),
                     model=self.model
                 )
@@ -127,20 +190,14 @@ class AIService:
                 return variants
                 
         except Exception as e:
-            log_operation_error(logger, "generate_variants", e)
+            log_operation_error(logger, "generate_variants_copilot", e)
             raise
     
     def _create_prompt(self, original_content: str, author_name: str, num_variants: int) -> str:
         """
         Create the prompt for generating post variants.
         
-        Args:
-            original_content: The original post content
-            author_name: Name of the original post author
-            num_variants: Number of variants to generate
-        
-        Returns:
-            The formatted prompt
+        Uses the same prompt as the GitHub Models service for consistency.
         """
         return f"""I need you to create {num_variants} alternative versions of the following LinkedIn post.
 
@@ -193,12 +250,7 @@ Now generate the {num_variants} variants:"""
         """
         Parse variants from the AI response.
         
-        Args:
-            content: The raw AI response content
-            expected_count: Expected number of variants
-        
-        Returns:
-            List of parsed variants
+        Uses the same parsing logic as the GitHub Models service.
         """
         # Split by the variant marker
         variants = content.split("---VARIANT---")
@@ -224,24 +276,17 @@ Now generate the {num_variants} variants:"""
         return cleaned_variants[:expected_count]  # Ensure we don't return too many
 
 
-def get_ai_service() -> AIService:
+def get_copilot_ai_service() -> Optional[GitHubCopilotAIService]:
     """
-    Get a configured AI service instance.
+    Get a configured GitHub Copilot AI service instance.
     
-    Tries to use GitHub Copilot first (higher rate limits), falls back to GitHub Models.
+    Returns None if Copilot tokens are not configured.
     """
-    # Try GitHub Copilot first if configured
-    try:
-        from app.ai_copilot import get_copilot_ai_service
-        copilot_service = get_copilot_ai_service()
-        if copilot_service:
-            logger.info("✅ Using GitHub Copilot AI service")
-            return copilot_service
-    except ImportError:
-        pass
-    except Exception as e:
-        logger.warning(f"⚠️  Could not load Copilot service, using GitHub Models: {e}")
-    
-    # Fall back to GitHub Models
-    logger.info("✅ Using GitHub Models AI service")
-    return AIService()
+    settings = get_settings()
+    if settings.github_copilot_access_token:
+        try:
+            return GitHubCopilotAIService()
+        except Exception as e:
+            logger.warning(f"⚠️  Could not initialize Copilot AI service: {e}")
+            return None
+    return None

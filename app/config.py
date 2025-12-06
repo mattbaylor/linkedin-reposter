@@ -10,9 +10,14 @@ class Settings(BaseSettings):
     
     # Infisical configuration (from environment)
     infisical_url: str = "https://infisical.example.com"
-    infisical_token: str  # Service Token (st.xxx.yyy.zzz)
+    infisical_token: str  # Service Token (st.xxx.yyy.zzz) for linkedin-reposter project
     infisical_project_id: str = "4627ccea-f94c-4f19-9605-6892dfd37ee0"
     infisical_environment: str = "dev"
+    opencode_infisical_project_id: Optional[str] = None  # OpenCode project ID for Copilot tokens
+    
+    # Machine Identity for cross-project access (optional)
+    infisical_machine_identity_client_id: Optional[str] = None
+    infisical_machine_identity_client_secret: Optional[str] = None
     
     # Application configuration (defaults, can be overridden)
     app_port: int = 8080
@@ -28,6 +33,10 @@ class Settings(BaseSettings):
     linkedin_handles: Optional[str] = None
     app_base_url: Optional[str] = None
     timezone: str = "America/Denver"
+    
+    # GitHub Copilot tokens (from OpenCode Infisical project)
+    github_copilot_access_token: Optional[str] = None
+    github_copilot_refresh_token: Optional[str] = None
     
     # Scraping configuration
     scraping_lookback_days: int = 7
@@ -110,6 +119,53 @@ def load_config() -> Settings:
                 print(f"   ✓ {key}: {display_value}")
         
         print(f"✅ Loaded {loaded_count} secrets from Infisical")
+        
+        # Optionally load GitHub Copilot tokens from OpenCode project
+        if settings.opencode_infisical_project_id:
+            try:
+                print(f"🔐 Loading GitHub Copilot tokens from OpenCode project...")
+                
+                # Use Machine Identity if configured, otherwise use same service token client
+                if settings.infisical_machine_identity_client_id and settings.infisical_machine_identity_client_secret:
+                    print(f"   Using Machine Identity for cross-project access...")
+                    opencode_client = InfisicalSDKClient(host=settings.infisical_url)
+                    opencode_client.auth.universal_auth.login(
+                        client_id=settings.infisical_machine_identity_client_id,
+                        client_secret=settings.infisical_machine_identity_client_secret
+                    )
+                else:
+                    print(f"   Using Service Token (may have limited access)...")
+                    opencode_client = client
+                
+                opencode_secrets = opencode_client.secrets.list_secrets(
+                    project_id=settings.opencode_infisical_project_id,
+                    environment_slug=settings.infisical_environment,
+                    secret_path="/"
+                )
+                
+                copilot_mapping = {
+                    "GITHUB_COPILOT_ACCESS_TOKEN": "github_copilot_access_token",
+                    "GITHUB_COPILOT_REFRESH_TOKEN": "github_copilot_refresh_token",
+                }
+                
+                copilot_count = 0
+                for secret in opencode_secrets.secrets:
+                    key = secret.secretKey
+                    value = secret.secretValue
+                    
+                    if key in copilot_mapping:
+                        attr_name = copilot_mapping[key]
+                        setattr(settings, attr_name, value)
+                        copilot_count += 1
+                        display_value = f"{value[:8]}..." if len(value) > 8 else "***"
+                        print(f"   ✓ {key}: {display_value}")
+                
+                if copilot_count > 0:
+                    print(f"✅ Loaded {copilot_count} GitHub Copilot tokens from OpenCode project")
+                else:
+                    print(f"⚠️  No Copilot tokens found in OpenCode project")
+            except Exception as e:
+                print(f"⚠️  Could not load OpenCode project tokens (will use GitHub Models): {e}")
         
         # Validate required secrets
         required = [

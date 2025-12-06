@@ -1,6 +1,6 @@
 """Admin dashboard HTML templates and helpers."""
 
-def get_dashboard_html(posts_data: list, stats: dict, settings) -> str:
+def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: str = None, current_author: str = None) -> str:
     """Generate admin dashboard HTML."""
     
     # Build posts HTML
@@ -389,12 +389,12 @@ def get_dashboard_html(posts_data: list, stats: dict, settings) -> str:
                 <label>
                     Status:
                     <select id="statusFilter" onchange="filterPosts()">
-                        <option value="">All</option>
-                        <option value="awaiting_approval" selected>Awaiting Approval</option>
-                        <option value="approved">Approved</option>
-                        <option value="rejected">Rejected</option>
-                        <option value="posted">Posted</option>
-                        <option value="failed">Failed</option>
+                        <option value="" {'selected' if not current_status else ''}>All</option>
+                        <option value="awaiting_approval" {'selected' if current_status == 'awaiting_approval' else ''}>Awaiting Approval</option>
+                        <option value="approved" {'selected' if current_status == 'approved' else ''}>Approved</option>
+                        <option value="rejected" {'selected' if current_status == 'rejected' else ''}>Rejected</option>
+                        <option value="posted" {'selected' if current_status == 'posted' else ''}>Posted</option>
+                        <option value="failed" {'selected' if current_status == 'failed' else ''}>Failed</option>
                     </select>
                 </label>
                 <label>

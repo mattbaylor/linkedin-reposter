@@ -632,6 +632,12 @@ async def vnc_viewer(request: Request):
     return HTMLResponse(content=html)
 
 
+@app.get("/admin")
+async def admin_root():
+    """Redirect /admin to /admin/dashboard."""
+    return RedirectResponse(url="/admin/dashboard")
+
+
 @app.get("/admin/dashboard", response_class=HTMLResponse)
 async def admin_dashboard(
     status: Optional[str] = Query(None),
@@ -647,12 +653,9 @@ async def admin_dashboard(
     # Build query
     query = select(LinkedInPost).options(selectinload(LinkedInPost.variants))
     
-    # Filter by status
+    # Filter by status (if provided)
     if status:
         query = query.where(LinkedInPost.status == PostStatus(status))
-    else:
-        # Default to awaiting approval
-        query = query.where(LinkedInPost.status == PostStatus.AWAITING_APPROVAL)
     
     # Filter by author
     if author:
@@ -726,7 +729,7 @@ async def admin_dashboard(
             'variants': variants_data
         })
     
-    html = get_dashboard_html(posts_data, stats, settings)
+    html = get_dashboard_html(posts_data, stats, settings, current_status=status, current_author=author)
     return HTMLResponse(content=html)
 
 
@@ -771,7 +774,7 @@ async def admin_approve_variant(
     scheduled_post = ScheduledPost(
         post_id=post.id,
         variant_id=variant_id,
-        scheduled_time=scheduled_time,
+        scheduled_for=scheduled_time,
         status=ScheduledPostStatus.PENDING
     )
     db.add(scheduled_post)
@@ -813,17 +816,19 @@ async def admin_regenerate_variants(
         variants = await ai_service.generate_variants(
             original_content=post.original_content,
             author_name=post.author_name,
-            author_handle=post.author_handle,
             num_variants=3
         )
         
         # Create new variant records
+        settings = get_settings()
         for i, variant_content in enumerate(variants, 1):
             variant = PostVariant(
                 original_post_id=post.id,
                 variant_number=i,
                 variant_content=variant_content,
-                status=VariantStatus.PENDING
+                status=VariantStatus.PENDING,
+                ai_model=settings.ai_model,
+                generation_prompt=f"Regenerated via admin dashboard"
             )
             db.add(variant)
         
