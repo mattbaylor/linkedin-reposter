@@ -75,6 +75,9 @@ INFISICAL_ENVIRONMENT=dev
 OPENCODE_INFISICAL_PROJECT_ID=your-opencode-project-id
 INFISICAL_MACHINE_IDENTITY_CLIENT_ID=your-machine-identity-client-id
 INFISICAL_MACHINE_IDENTITY_CLIENT_SECRET=your-machine-identity-client-secret
+
+# VNC Password (REQUIRED for security - no default provided)
+VNC_PASSWORD=your-strong-vnc-password-here
 ```
 
 **How to get your Infisical Service Token:**
