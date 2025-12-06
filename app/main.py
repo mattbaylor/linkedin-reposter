@@ -20,6 +20,7 @@ from app.ai import get_ai_service
 from app.linkedin import get_linkedin_service
 from app.linkedin_selenium import get_selenium_linkedin_service
 from app.scheduler import get_scheduler
+from app.admin_dashboard import get_dashboard_html
 from app.schemas import (
     LinkedInPostResponse,
     LinkedInPostDetailResponse,
@@ -629,6 +630,288 @@ async def vnc_viewer(request: Request):
     """
     
     return HTMLResponse(content=html)
+
+
+@app.get("/admin/dashboard", response_class=HTMLResponse)
+async def admin_dashboard(
+    status: Optional[str] = Query(None),
+    author: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Admin dashboard for managing posts and variants.
+    Shows all posts with ability to approve, regenerate, or reject.
+    """
+    settings = get_settings()
+    
+    # Build query
+    query = select(LinkedInPost).options(selectinload(LinkedInPost.variants))
+    
+    # Filter by status
+    if status:
+        query = query.where(LinkedInPost.status == PostStatus(status))
+    else:
+        # Default to awaiting approval
+        query = query.where(LinkedInPost.status == PostStatus.AWAITING_APPROVAL)
+    
+    # Filter by author
+    if author:
+        query = query.where(LinkedInPost.author_handle == author)
+    
+    # Order by most recent first
+    query = query.order_by(LinkedInPost.scraped_at.desc())
+    
+    # Execute query
+    result = await db.execute(query)
+    posts = result.scalars().all()
+    
+    # Get stats
+    stats_result = await db.execute(select(func.count()).select_from(LinkedInPost))
+    total_posts = stats_result.scalar_one()
+    
+    awaiting_result = await db.execute(
+        select(func.count()).select_from(LinkedInPost).where(
+            LinkedInPost.status == PostStatus.AWAITING_APPROVAL
+        )
+    )
+    awaiting_approval = awaiting_result.scalar_one()
+    
+    approved_result = await db.execute(
+        select(func.count()).select_from(LinkedInPost).where(
+            LinkedInPost.status == PostStatus.APPROVED
+        )
+    )
+    approved = approved_result.scalar_one()
+    
+    posted_result = await db.execute(
+        select(func.count()).select_from(LinkedInPost).where(
+            LinkedInPost.status == PostStatus.POSTED
+        )
+    )
+    posted = posted_result.scalar_one()
+    
+    rejected_result = await db.execute(
+        select(func.count()).select_from(LinkedInPost).where(
+            LinkedInPost.status == PostStatus.REJECTED
+        )
+    )
+    rejected = rejected_result.scalar_one()
+    
+    stats = {
+        'total_posts': total_posts,
+        'awaiting_approval': awaiting_approval,
+        'approved': approved,
+        'posted': posted,
+        'rejected': rejected
+    }
+    
+    # Convert posts to dict
+    posts_data = []
+    for post in posts:
+        variants_data = []
+        for variant in post.variants:
+            variants_data.append({
+                'id': variant.id,
+                'content': variant.variant_content,
+                'status': variant.status.value
+            })
+        
+        posts_data.append({
+            'id': post.id,
+            'author_name': post.author_name,
+            'author_handle': post.author_handle,
+            'original_content': post.original_content,
+            'status': post.status.value,
+            'scraped_at': post.scraped_at.strftime('%Y-%m-%d %H:%M'),
+            'variants': variants_data
+        })
+    
+    html = get_dashboard_html(posts_data, stats, settings)
+    return HTMLResponse(content=html)
+
+
+@app.post("/admin/posts/{post_id}/approve/{variant_id}")
+async def admin_approve_variant(
+    post_id: int,
+    variant_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Approve a specific variant from admin dashboard."""
+    log_operation_start(logger, "admin_approve_variant", post_id=post_id, variant_id=variant_id)
+    
+    # Get the post
+    result = await db.execute(
+        select(LinkedInPost)
+        .options(selectinload(LinkedInPost.variants))
+        .where(LinkedInPost.id == post_id)
+    )
+    post = result.scalar_one_or_none()
+    
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # Get the variant
+    variant = next((v for v in post.variants if v.id == variant_id), None)
+    if not variant:
+        raise HTTPException(status_code=404, detail="Variant not found")
+    
+    # Update post status
+    post.status = PostStatus.APPROVED
+    post.approved_at = datetime.utcnow()
+    
+    # Update variant statuses
+    for v in post.variants:
+        if v.id == variant_id:
+            v.status = VariantStatus.APPROVED
+        else:
+            v.status = VariantStatus.REJECTED
+    
+    # Create scheduled post (post in 1 hour)
+    scheduled_time = datetime.utcnow() + timedelta(hours=1)
+    scheduled_post = ScheduledPost(
+        post_id=post.id,
+        variant_id=variant_id,
+        scheduled_time=scheduled_time,
+        status=ScheduledPostStatus.PENDING
+    )
+    db.add(scheduled_post)
+    
+    await db.commit()
+    
+    log_operation_success(logger, "admin_approve_variant", post_id=post_id, variant_id=variant_id)
+    
+    return {"success": True, "message": "Variant approved", "scheduled_time": scheduled_time.isoformat()}
+
+
+@app.post("/admin/posts/{post_id}/regenerate")
+async def admin_regenerate_variants(
+    post_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Regenerate AI variants for a post."""
+    log_operation_start(logger, "admin_regenerate_variants", post_id=post_id)
+    
+    # Get the post
+    result = await db.execute(
+        select(LinkedInPost)
+        .options(selectinload(LinkedInPost.variants))
+        .where(LinkedInPost.id == post_id)
+    )
+    post = result.scalar_one_or_none()
+    
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # Delete old variants
+    for variant in post.variants:
+        await db.delete(variant)
+    
+    # Generate new variants
+    ai_service = get_ai_service()
+    
+    try:
+        variants = await ai_service.generate_variants(
+            original_content=post.original_content,
+            author_name=post.author_name,
+            author_handle=post.author_handle,
+            num_variants=3
+        )
+        
+        # Create new variant records
+        for i, variant_content in enumerate(variants, 1):
+            variant = PostVariant(
+                original_post_id=post.id,
+                variant_number=i,
+                variant_content=variant_content,
+                status=VariantStatus.PENDING
+            )
+            db.add(variant)
+        
+        # Update post status
+        post.status = PostStatus.AWAITING_APPROVAL
+        
+        await db.commit()
+        
+        log_operation_success(logger, "admin_regenerate_variants", post_id=post_id, variants_count=len(variants))
+        
+        return {"success": True, "message": f"Generated {len(variants)} new variants"}
+        
+    except Exception as e:
+        log_operation_error(logger, "admin_regenerate_variants", e, post_id=post_id)
+        raise HTTPException(status_code=500, detail=f"Failed to generate variants: {str(e)}")
+
+
+@app.post("/admin/posts/{post_id}/reject")
+async def admin_reject_post(
+    post_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Reject all variants for a post."""
+    log_operation_start(logger, "admin_reject_post", post_id=post_id)
+    
+    # Get the post
+    result = await db.execute(
+        select(LinkedInPost)
+        .options(selectinload(LinkedInPost.variants))
+        .where(LinkedInPost.id == post_id)
+    )
+    post = result.scalar_one_or_none()
+    
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # Update post and variant statuses
+    post.status = PostStatus.REJECTED
+    post.rejected_at = datetime.utcnow()
+    
+    for variant in post.variants:
+        variant.status = VariantStatus.REJECTED
+    
+    await db.commit()
+    
+    log_operation_success(logger, "admin_reject_post", post_id=post_id)
+    
+    return {"success": True, "message": "Post rejected"}
+
+
+@app.delete("/admin/posts/{post_id}")
+async def admin_delete_post(
+    post_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Permanently delete a post and all its variants."""
+    log_operation_start(logger, "admin_delete_post", post_id=post_id)
+    
+    # Get the post
+    result = await db.execute(
+        select(LinkedInPost)
+        .options(selectinload(LinkedInPost.variants))
+        .where(LinkedInPost.id == post_id)
+    )
+    post = result.scalar_one_or_none()
+    
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # Delete variants first (due to foreign key)
+    for variant in post.variants:
+        await db.delete(variant)
+    
+    # Delete any scheduled posts
+    scheduled_result = await db.execute(
+        select(ScheduledPost).where(ScheduledPost.post_id == post_id)
+    )
+    scheduled_posts = scheduled_result.scalars().all()
+    for sched in scheduled_posts:
+        await db.delete(sched)
+    
+    # Delete the post
+    await db.delete(post)
+    await db.commit()
+    
+    log_operation_success(logger, "admin_delete_post", post_id=post_id)
+    
+    return {"success": True, "message": "Post deleted"}
 
 
 @app.get("/stats", response_model=StatsResponse)

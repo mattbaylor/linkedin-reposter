@@ -1,10 +1,10 @@
 services:
   app:
-    image: ghcr.io/mattbaylor/linkedin-reposter:latest
+    # image: ghcr.io/mattbaylor/linkedin-reposter:latest
     # Uncomment below to build locally instead of using pre-built image
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: linkedin-reposter
     ports:
       - "8080:8080"
