@@ -1,10 +1,6 @@
 services:
   app:
     image: ghcr.io/mattbaylor/linkedin-reposter:latest
-    # Uncomment below to build locally instead of using pre-built image
-    # build:
-    #   context: .
-    #   dockerfile: Dockerfile
     container_name: linkedin-reposter
     ports:
       - "8080:8080"
@@ -13,11 +9,11 @@ services:
     environment:
       - INFISICAL_URL=${INFISICAL_URL:-https://infisical.example.com}
       - INFISICAL_TOKEN=${INFISICAL_TOKEN}
-      - INFISICAL_PROJECT_ID=${INFISICAL_PROJECT_ID:-LinkedInReposter}
-      - INFISICAL_ENVIRONMENT=${INFISICAL_ENVIRONMENT:-dev}
+      - INFISICAL_PROJECT_ID=${INFISICAL_PROJECT_ID:-4627ccea-f94c-4f19-9605-6892dfd37ee0}
+      - INFISICAL_ENVIRONMENT=${INFISICAL_ENVIRONMENT:-prod}
       - APP_PORT=${APP_PORT:-8080}
       - AI_MODEL=${AI_MODEL:-gpt-4o}
-      - VNC_PASSWORD=${VNC_PASSWORD:-linkedin123}
+      - VNC_PASSWORD=${VNC_PASSWORD:-}
       - DISPLAY=:99
     volumes:
       - ./data:/app/data

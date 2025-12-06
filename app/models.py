@@ -18,8 +18,12 @@ class PostStatus(str, enum.Enum):
     AWAITING_APPROVAL = "awaiting_approval"    # Email sent, waiting for approval
     APPROVED = "approved"         # User approved a variant
     REJECTED = "rejected"         # User rejected all variants
+    QUEUED = "queued"            # Scheduled for posting
+    POSTING = "posting"          # Currently attempting to repost
     POSTED = "posted"            # Successfully posted to LinkedIn
-    FAILED = "failed"            # Failed to post
+    MISSING = "missing"          # Original post not found, needs retry
+    FAILED = "failed"            # Failed to post after max retries
+    SKIPPED = "skipped"          # User ignored/skipped
 
 
 class VariantStatus(str, enum.Enum):
@@ -45,7 +49,7 @@ class LinkedInPost(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     
     # Source information
-    original_post_url: Mapped[str] = mapped_column(String(500), unique=True, index=True)
+    original_post_url: Mapped[str] = mapped_column(String(500), index=True, nullable=True)  # Not unique - using fuzzy match instead
     author_handle: Mapped[str] = mapped_column(String(100), index=True)
     author_name: Mapped[str] = mapped_column(String(200))
     
@@ -68,6 +72,12 @@ class LinkedInPost(Base):
     approval_email_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    
+    # Reposting tracking
+    scheduled_post_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    priority: Mapped[int] = mapped_column(Integer, default=100)  # Higher = more urgent
+    approved_variant_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     
     # Error tracking
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -222,4 +232,31 @@ class ScheduledPost(Base):
     
     def __repr__(self) -> str:
         return f"<ScheduledPost(id={self.id}, post_id={self.post_id}, scheduled_for={self.scheduled_for}, status={self.status.value})>"
+
+
+class SystemHealth(Base):
+    """Tracks system health metrics and alerts."""
+    __tablename__ = "system_health"
+    
+    id: Mapped[int] = mapped_column(primary_key=True)
+    
+    # Health tracking
+    last_successful_post_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_successful_scrape_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    
+    # Alert tracking
+    health_alert_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    health_alert_resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    
+    # Metrics
+    total_posts_scraped: Mapped[int] = mapped_column(Integer, default=0)
+    total_posts_posted: Mapped[int] = mapped_column(Integer, default=0)
+    total_posts_failed: Mapped[int] = mapped_column(Integer, default=0)
+    
+    # Metadata
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def __repr__(self) -> str:
+        return f"<SystemHealth(last_post={self.last_successful_post_time}, scraped={self.total_posts_scraped}, posted={self.total_posts_posted})>"
+
 

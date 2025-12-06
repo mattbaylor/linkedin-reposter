@@ -1,10 +1,12 @@
 """Application entry point with FastAPI."""
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -16,6 +18,7 @@ from app.models import LinkedInPost, PostVariant, ApprovalRequest, PostStatus, V
 from app.email import get_email_service, generate_approval_token
 from app.ai import get_ai_service
 from app.linkedin import get_linkedin_service
+from app.linkedin_selenium import get_selenium_linkedin_service
 from app.scheduler import get_scheduler
 from app.schemas import (
     LinkedInPostResponse,
@@ -27,6 +30,7 @@ from app.schemas import (
     StatsResponse,
     ScheduledPostResponse,
     ScheduleQueueResponse,
+    LinkedInCookieAuth,
 )
 from app.logging_config import (
     setup_logging,
@@ -87,25 +91,18 @@ async def check_and_publish_posts():
                 
                 logger.info(f"📬 Found {len(due_posts)} post(s) due for publishing")
                 
-                # Publish each due post
-                linkedin = get_linkedin_service()
+                # Use Selenium service for reposting
+                settings = get_settings()
+                linkedin = get_selenium_linkedin_service(
+                    headless=False,  # Run with display for VNC debugging
+                    email=settings.linkedin_email,
+                    password=settings.linkedin_password
+                )
+                
+                # Import health monitoring
+                from app.health_monitor import update_last_successful_post, increment_failed_posts
                 
                 try:
-                    await linkedin.start()
-                    
-                    # Check session health
-                    health = linkedin.check_session_health()
-                    if health["status"] == "expired":
-                        logger.error("❌ LinkedIn session expired - cannot publish posts")
-                        return
-                    
-                    # Login if needed
-                    if not linkedin.is_logged_in:
-                        login_success = await linkedin.login()
-                        if not login_success:
-                            logger.error("❌ Failed to login - cannot publish posts")
-                            return
-                    
                     published_count = 0
                     failed_count = 0
                     
@@ -118,14 +115,29 @@ async def check_and_publish_posts():
                         )
                         
                         try:
-                            # Get variant content
-                            if not scheduled_post.variant:
-                                raise ValueError(f"Variant {variant_id} not found")
+                            # Get the original post with all details
+                            post_result = await db.execute(
+                                select(LinkedInPost).where(LinkedInPost.id == post_id)
+                            )
+                            post = post_result.scalar_one_or_none()
                             
-                            content = scheduled_post.variant.variant_content
+                            if not post:
+                                raise ValueError(f"Post {post_id} not found")
                             
-                            # Publish to LinkedIn
-                            success = await linkedin.publish_post(content)
+                            if not post.approved_variant_text:
+                                raise ValueError(f"Post {post_id} has no approved variant text")
+                            
+                            # Update post status to POSTING
+                            post.status = PostStatus.POSTING
+                            await db.commit()
+                            
+                            # Attempt to repost using our new repost flow
+                            success = await linkedin.repost_with_variant(
+                                author_handle=post.author_handle,
+                                original_content=post.original_content,
+                                variant_text=post.approved_variant_text,
+                                fuzzy_threshold=0.80
+                            )
                             
                             if success:
                                 # Update scheduled post status
@@ -133,23 +145,37 @@ async def check_and_publish_posts():
                                 scheduled_post.published_at = datetime.now()
                                 
                                 # Update original post status
-                                if scheduled_post.post:
-                                    scheduled_post.post.status = PostStatus.POSTED
-                                    scheduled_post.post.posted_at = datetime.now()
+                                post.status = PostStatus.POSTED
+                                post.posted_at = datetime.now()
+                                post.error_message = None
+                                
+                                # Update health monitoring
+                                await update_last_successful_post(db)
                                 
                                 published_count += 1
                                 logger.info(f"✅ Published post {post_id} successfully")
                             else:
-                                # Publishing failed
+                                # Repost failed - original post not found
                                 scheduled_post.retry_count += 1
-                                scheduled_post.last_error = "LinkedIn publish failed"
+                                scheduled_post.last_error = "Original post not found on LinkedIn"
+                                
+                                # Update post status to MISSING
+                                post.status = PostStatus.MISSING
+                                post.error_message = f"Could not find original post (attempt {scheduled_post.retry_count})"
+                                post.retry_count = scheduled_post.retry_count
+                                
+                                # Lower priority for next attempt
+                                post.priority = max(0, post.priority - 20)
                                 
                                 # Mark as failed if too many retries
-                                max_retries = 3
+                                max_retries = 5
                                 if scheduled_post.retry_count >= max_retries:
                                     scheduled_post.status = ScheduledPostStatus.FAILED
-                                    if scheduled_post.post:
-                                        scheduled_post.post.status = PostStatus.FAILED
+                                    post.status = PostStatus.FAILED
+                                    post.error_message = f"Failed after {max_retries} attempts - original post not found"
+                                    
+                                    await increment_failed_posts(db)
+                                    
                                     logger.error(
                                         f"❌ Post {post_id} failed after {max_retries} retries"
                                     )
@@ -157,7 +183,7 @@ async def check_and_publish_posts():
                                     # Reschedule for 30 minutes later
                                     scheduled_post.scheduled_for = now + timedelta(minutes=30)
                                     logger.warning(
-                                        f"⚠️  Post {post_id} failed (retry {scheduled_post.retry_count}/{max_retries}), "
+                                        f"⚠️  Post {post_id} not found (retry {scheduled_post.retry_count}/{max_retries}), "
                                         f"rescheduled for {scheduled_post.scheduled_for.strftime('%I:%M%p')}"
                                     )
                                 
@@ -172,11 +198,20 @@ async def check_and_publish_posts():
                             scheduled_post.retry_count += 1
                             scheduled_post.last_error = str(e)
                             
-                            max_retries = 3
+                            # Update post status
+                            post_result = await db.execute(
+                                select(LinkedInPost).where(LinkedInPost.id == post_id)
+                            )
+                            post = post_result.scalar_one_or_none()
+                            if post:
+                                post.status = PostStatus.FAILED if scheduled_post.retry_count >= 5 else PostStatus.MISSING
+                                post.error_message = str(e)
+                                post.retry_count = scheduled_post.retry_count
+                            
+                            max_retries = 5
                             if scheduled_post.retry_count >= max_retries:
                                 scheduled_post.status = ScheduledPostStatus.FAILED
-                                if scheduled_post.post:
-                                    scheduled_post.post.status = PostStatus.FAILED
+                                await increment_failed_posts(db)
                             else:
                                 scheduled_post.scheduled_for = now + timedelta(minutes=30)
                             
@@ -202,6 +237,196 @@ async def check_and_publish_posts():
                 
     except Exception as e:
         log_operation_error(logger, "check_and_publish_posts", e)
+
+
+async def scheduled_scrape_and_process():
+    """
+    Scheduled background task to scrape LinkedIn posts and process them.
+    
+    This function runs at 11am and 4pm MST/MDT and:
+    1. Scrapes posts from all monitored handles
+    2. Generates AI variants for each post
+    3. Sends approval emails to the user
+    """
+    log_operation_start(logger, "scheduled_scrape_and_process")
+    
+    settings = get_settings()
+    handles = settings.linkedin_handles.split(',')
+    
+    logger.info(f"🔍 Starting scheduled scrape for {len(handles)} handles")
+    
+    # Import health monitoring
+    from app.health_monitor import update_last_successful_scrape
+    
+    total_scraped = 0
+    total_processed = 0
+    total_failed = 0
+    
+    try:
+        # Get database session
+        async for db in get_db():
+            try:
+                # Get services
+                linkedin = get_selenium_linkedin_service(
+                    headless=False,
+                    email=settings.linkedin_email,
+                    password=settings.linkedin_password
+                )
+                ai_service = get_ai_service()
+                email_service = get_email_service()
+                
+                # Start browser once for all handles
+                await linkedin.start()
+                
+                try:
+                    # Scrape each handle
+                    for handle in handles:
+                        handle = handle.strip()
+                        logger.info(f"📥 Scraping @{handle}...")
+                        
+                        try:
+                            # Scrape posts from this handle
+                            posts = await linkedin.scrape_user_posts(
+                                handle=handle,
+                                max_posts=10,  # Check last 10 posts
+                                days_back=7    # Within last 7 days
+                            )
+                            
+                            logger.info(f"✅ Scraped {len(posts)} posts from @{handle}")
+                            total_scraped += len(posts)
+                            
+                            # Update health monitoring
+                            await update_last_successful_scrape(db)
+                            
+                            # Process each scraped post
+                            for post_data in posts:
+                                try:
+                                    # Check if we already have this post (fuzzy match on content + author)
+                                    from app.utils import fuzzy_match
+                                    
+                                    existing_posts = await db.execute(
+                                        select(LinkedInPost).where(
+                                            LinkedInPost.author_handle == handle
+                                        )
+                                    )
+                                    existing = existing_posts.scalars().all()
+                                    
+                                    # Check for duplicate using fuzzy matching
+                                    is_duplicate = False
+                                    for existing_post in existing:
+                                        if fuzzy_match(existing_post.original_content, post_data.content, threshold=0.90):
+                                            logger.info(f"⏭️  Skipping duplicate post from @{handle}")
+                                            is_duplicate = True
+                                            break
+                                    
+                                    if is_duplicate:
+                                        continue
+                                    
+                                    # Create new post in database
+                                    new_post = LinkedInPost(
+                                        original_post_url=post_data.url,
+                                        author_handle=handle,
+                                        author_name=post_data.author_name,
+                                        original_content=post_data.content,
+                                        original_post_date=post_data.post_date,
+                                        status=PostStatus.SCRAPED,
+                                        scraped_at=datetime.utcnow()
+                                    )
+                                    db.add(new_post)
+                                    await db.flush()  # Get the ID
+                                    
+                                    logger.info(f"💾 Saved post {new_post.id} from @{handle}")
+                                    
+                                    # Generate AI variants
+                                    logger.info(f"🤖 Generating AI variants for post {new_post.id}...")
+                                    variant_texts = await ai_service.generate_variants(
+                                        original_content=post_data.content,
+                                        author_name=post_data.author_name,
+                                        num_variants=3
+                                    )
+                                    
+                                    # Save variants to database
+                                    variants = []
+                                    for i, variant_text in enumerate(variant_texts, 1):
+                                        variant = PostVariant(
+                                            original_post_id=new_post.id,
+                                            variant_number=i,
+                                            variant_content=variant_text,
+                                            ai_model=settings.ai_model,
+                                            status=VariantStatus.PENDING
+                                        )
+                                        db.add(variant)
+                                        variants.append(variant)
+                                    
+                                    await db.flush()
+                                    
+                                    # Update post status
+                                    new_post.status = PostStatus.VARIANTS_GENERATED
+                                    new_post.variants_generated_at = datetime.utcnow()
+                                    
+                                    logger.info(f"✅ Generated {len(variants)} variants for post {new_post.id}")
+                                    
+                                    # Create approval request
+                                    approval_token = generate_approval_token()
+                                    approval_request = ApprovalRequest(
+                                        original_post_id=new_post.id,
+                                        approval_token=approval_token,
+                                        expires_at=datetime.utcnow() + timedelta(days=7)
+                                    )
+                                    db.add(approval_request)
+                                    await db.flush()
+                                    
+                                    # Send approval email
+                                    logger.info(f"📧 Sending approval email for post {new_post.id}...")
+                                    email_response = await email_service.send_approval_email(
+                                        post=new_post,
+                                        variants=variants,
+                                        approval_token=approval_token
+                                    )
+                                    
+                                    # Update post status
+                                    new_post.status = PostStatus.AWAITING_APPROVAL
+                                    new_post.approval_email_sent_at = datetime.utcnow()
+                                    
+                                    logger.info(f"✅ Sent approval email for post {new_post.id}")
+                                    
+                                    await db.commit()
+                                    total_processed += 1
+                                    
+                                except Exception as e:
+                                    logger.error(f"❌ Failed to process post from @{handle}: {e}")
+                                    await db.rollback()
+                                    total_failed += 1
+                                    continue
+                            
+                        except Exception as e:
+                            logger.error(f"❌ Failed to scrape @{handle}: {e}")
+                            total_failed += 1
+                            continue
+                
+                finally:
+                    # Stop browser after all handles
+                    await linkedin.stop()
+                
+                logger.info(f"✅ Scheduled scrape complete:")
+                logger.info(f"   📥 Scraped: {total_scraped} posts")
+                logger.info(f"   ✅ Processed: {total_processed} posts")
+                logger.info(f"   ❌ Failed: {total_failed} posts")
+                
+                log_operation_success(
+                    logger,
+                    "scheduled_scrape_and_process",
+                    scraped=total_scraped,
+                    processed=total_processed,
+                    failed=total_failed
+                )
+                
+            finally:
+                await db.close()
+                break  # Only use first session from generator
+                
+    except Exception as e:
+        log_operation_error(logger, "scheduled_scrape_and_process", e)
 
 
 @asynccontextmanager
@@ -231,9 +456,10 @@ async def lifespan(app: FastAPI):
     # Start background scheduler
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
     from apscheduler.triggers.interval import IntervalTrigger
+    from apscheduler.triggers.cron import CronTrigger
     import asyncio
     
-    scheduler_instance = AsyncIOScheduler()
+    scheduler_instance = AsyncIOScheduler(timezone='America/Denver')  # MST/MDT
     
     # Check for posts to publish every 5 minutes
     scheduler_instance.add_job(
@@ -244,8 +470,19 @@ async def lifespan(app: FastAPI):
         replace_existing=True
     )
     
+    # Scrape LinkedIn posts at 11am and 4pm MST/MDT
+    scheduler_instance.add_job(
+        func=lambda: asyncio.create_task(scheduled_scrape_and_process()),
+        trigger=CronTrigger(hour='11,16', minute='0', timezone='America/Denver'),
+        id='scheduled_scrape',
+        name='Scrape LinkedIn posts and send for approval',
+        replace_existing=True
+    )
+    
     scheduler_instance.start()
-    logger.info("✅ Background scheduler started (checking every 5 minutes)")
+    logger.info("✅ Background scheduler started")
+    logger.info("   📅 Publishing check: Every 5 minutes")
+    logger.info("   📅 Scraping schedule: 11:00 AM and 4:00 PM MST/MDT")
     
     yield
     
@@ -263,6 +500,12 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan
 )
+
+# Mount noVNC static files for web-based VNC access
+import os
+if os.path.exists("/app/static/novnc"):
+    app.mount("/novnc", StaticFiles(directory="/app/static/novnc"), name="novnc")
+    logger.info("✅ noVNC static files mounted at /novnc")
 
 
 # Request logging middleware
@@ -322,6 +565,70 @@ async def health(db: AsyncSession = Depends(get_db)):
         timezone=settings.timezone,
         database_initialized=database_initialized
     )
+
+
+@app.get("/admin/vnc", response_class=HTMLResponse)
+async def vnc_viewer(request: Request):
+    """
+    Web-based VNC viewer for manual intervention during security challenges.
+    
+    This endpoint serves a full-screen noVNC viewer that connects to the
+    browser automation session, allowing admin to resolve LinkedIn security
+    challenges without needing a separate VNC client.
+    """
+    settings = get_settings()
+    
+    # Detect if we're behind a reverse proxy or accessing locally
+    host = request.headers.get("host", "localhost:8080")
+    is_production = not host.startswith("localhost")
+    
+    # For production (reverse proxy), use path-based WebSocket connection
+    # For local, use host:port connection
+    if is_production:
+        vnc_params = "path=websockify&autoconnect=true&resize=scale&reconnect=true&password="
+    else:
+        vnc_params = "host=localhost&port=6080&autoconnect=true&resize=scale&reconnect=true&password="
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>LinkedIn Scraper - VNC Access</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body {{
+                margin: 0;
+                overflow: hidden;
+                background: #1a1a1a;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            }}
+            #status {{
+                position: absolute;
+                top: 10px;
+                left: 10px;
+                background: rgba(0,0,0,0.8);
+                color: #fff;
+                padding: 10px 15px;
+                border-radius: 5px;
+                font-size: 14px;
+                z-index: 1000;
+            }}
+            iframe {{
+                width: 100vw;
+                height: 100vh;
+                border: none;
+            }}
+        </style>
+    </head>
+    <body>
+        <div id="status">🔒 Secure VNC Connection - LinkedIn Scraper</div>
+        <iframe src="/novnc/vnc.html?{vnc_params}"></iframe>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html)
 
 
 @app.get("/stats", response_model=StatsResponse)
@@ -449,7 +756,7 @@ async def get_post(post_id: int, db: AsyncSession = Depends(get_db)):
     return LinkedInPostDetailResponse.model_validate(post)
 
 
-@app.get("/webhook/approve/{token}", response_model=ApprovalWebhookResponse)
+@app.get("/webhook/approve/{token}")
 async def approve_webhook(
     token: str,
     variant_id: int = Query(..., description="ID of the variant to approve"),
@@ -531,12 +838,14 @@ async def approve_webhook(
     log_database_operation(logger, "UPDATE", "post_variants", variant.id, 
                           status=VariantStatus.APPROVED.value)
     
-    # Update original post status
+    # Update original post status and save approved variant text
     approval_request.original_post.status = PostStatus.APPROVED
     approval_request.original_post.approved_at = datetime.utcnow()
+    approval_request.original_post.approved_variant_text = variant.variant_content
     
     log_database_operation(logger, "UPDATE", "linkedin_posts", post_id, 
-                          status=PostStatus.APPROVED.value)
+                          status=PostStatus.APPROVED.value, 
+                          approved_variant_text=f"{variant.variant_content[:50]}...")
     
     # Mark other variants as rejected
     rejected_count = 0
@@ -574,15 +883,90 @@ async def approve_webhook(
     
     log_operation_success(logger, "approve_webhook", post_id=post_id, variant_id=variant_id)
     
-    return ApprovalWebhookResponse(
-        success=True,
-        message=f"Post approved and scheduled for {scheduled_time.strftime('%A %b %d at %I:%M%p')} ({time_str} from now)",
-        post_id=post_id,
-        variant_id=variant_id
+    # Return a simple HTML confirmation page
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Post Approved</title>
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                min-height: 100vh;
+                margin: 0;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            }}
+            .container {{
+                background: white;
+                padding: 3rem;
+                border-radius: 1rem;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                text-align: center;
+                max-width: 500px;
+            }}
+            .checkmark {{
+                font-size: 4rem;
+                color: #10b981;
+                margin-bottom: 1rem;
+            }}
+            h1 {{
+                color: #1f2937;
+                margin: 0 0 1rem 0;
+                font-size: 2rem;
+            }}
+            p {{
+                color: #6b7280;
+                line-height: 1.6;
+                margin: 0.5rem 0;
+            }}
+            .schedule-info {{
+                background: #f3f4f6;
+                padding: 1rem;
+                border-radius: 0.5rem;
+                margin-top: 1.5rem;
+            }}
+            .schedule-info strong {{
+                color: #667eea;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="checkmark">✓</div>
+            <h1>Post Approved!</h1>
+            <p>Your selected variant has been approved and scheduled for posting.</p>
+            <div class="schedule-info">
+                <p><strong>Scheduled for:</strong><br>
+                {scheduled_time.strftime('%A, %B %d at %I:%M %p')}</p>
+                <p style="margin-top: 0.5rem; font-size: 0.9rem;">
+                ({time_str} from now)
+                </p>
+            </div>
+            <p style="margin-top: 1.5rem; font-size: 0.9rem; color: #9ca3af;">
+                You can close this window.
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return Response(
+        content=html_content,
+        media_type="text/html",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
     )
 
 
-@app.get("/webhook/reject/{token}", response_model=RejectionWebhookResponse)
+@app.get("/webhook/reject/{token}")
 async def reject_webhook(
     token: str,
     db: AsyncSession = Depends(get_db)
@@ -591,6 +975,7 @@ async def reject_webhook(
     Reject a post via webhook link from email.
     
     This endpoint is called when a user clicks the rejection link in the email.
+    Returns a simple confirmation page.
     """
     # Find approval request by token
     query = select(ApprovalRequest).where(
@@ -607,11 +992,60 @@ async def reject_webhook(
     
     # Check if already responded
     if approval_request.is_approved or approval_request.is_rejected:
-        return RejectionWebhookResponse(
-            success=False,
-            message="This approval request has already been responded to",
-            post_id=approval_request.original_post_id
-        )
+        logger.warning(f"⚠️  Rejection link already used for post {approval_request.original_post_id}")
+        html_content = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Already Responded</title>
+            <style>
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    min-height: 100vh;
+                    margin: 0;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                }
+                .container {
+                    background: white;
+                    padding: 3rem;
+                    border-radius: 1rem;
+                    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                    text-align: center;
+                    max-width: 500px;
+                }
+                .icon {
+                    font-size: 4rem;
+                    margin-bottom: 1rem;
+                }
+                h1 {
+                    color: #1f2937;
+                    margin: 0 0 1rem 0;
+                    font-size: 2rem;
+                }
+                p {
+                    color: #6b7280;
+                    line-height: 1.6;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="icon">ℹ️</div>
+                <h1>Already Responded</h1>
+                <p>This approval request has already been responded to.</p>
+                <p style="margin-top: 1.5rem; font-size: 0.9rem; color: #9ca3af;">
+                    You can close this window.
+                </p>
+            </div>
+        </body>
+        </html>
+        """
+        return Response(content=html_content, media_type="text/html")
     
     # Update approval request
     from datetime import datetime
@@ -629,10 +1063,69 @@ async def reject_webhook(
     
     logger.info(f"❌ Post {approval_request.original_post_id} rejected")
     
-    return RejectionWebhookResponse(
-        success=True,
-        message="Post rejected successfully. No action will be taken.",
-        post_id=approval_request.original_post_id
+    # Return a simple HTML confirmation page
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Post Rejected</title>
+        <style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                min-height: 100vh;
+                margin: 0;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            }
+            .container {
+                background: white;
+                padding: 3rem;
+                border-radius: 1rem;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                text-align: center;
+                max-width: 500px;
+            }
+            .checkmark {
+                font-size: 4rem;
+                color: #ef4444;
+                margin-bottom: 1rem;
+            }
+            h1 {
+                color: #1f2937;
+                margin: 0 0 1rem 0;
+                font-size: 2rem;
+            }
+            p {
+                color: #6b7280;
+                line-height: 1.6;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="checkmark">✗</div>
+            <h1>Post Rejected</h1>
+            <p>This post has been rejected and will not be posted to LinkedIn.</p>
+            <p style="margin-top: 1.5rem; font-size: 0.9rem; color: #9ca3af;">
+                You can close this window.
+            </p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return Response(
+        content=html_content,
+        media_type="text/html",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
     )
 
 
@@ -803,6 +1296,31 @@ Check it out and let me know what you think!
         )
 
 
+@app.post("/test/trigger-scrape")
+async def test_trigger_scrape():
+    """
+    Manually trigger the scheduled scraping workflow.
+    
+    This is useful for testing without waiting for 11am/4pm.
+    Runs the same logic as the scheduled task:
+    1. Scrapes all monitored handles
+    2. Generates AI variants
+    3. Sends approval emails
+    """
+    log_operation_start(logger, "test_trigger_scrape")
+    
+    logger.info("🚀 Manually triggering scheduled scrape workflow...")
+    
+    # Run the scheduled scrape function
+    import asyncio
+    asyncio.create_task(scheduled_scrape_and_process())
+    
+    return {
+        "success": True,
+        "message": "Scheduled scrape triggered manually. Check logs for progress."
+    }
+
+
 @app.post("/test/linkedin-login")
 async def test_linkedin_login():
     """
@@ -929,6 +1447,78 @@ If you're seeing this, our automation is working! 🚀
 
 # LinkedIn Session Management Endpoints
 
+@app.post("/linkedin/vnc-login")
+async def linkedin_vnc_login(wait_time: int = Query(300, ge=60, le=600, description="Seconds to wait for manual login")):
+    """
+    Open browser via VNC for manual LinkedIn login.
+    
+    This endpoint:
+    1. Opens Chrome browser (visible via VNC on port 5900)
+    2. Navigates to LinkedIn login page
+    3. Waits for you to manually login
+    4. Saves the complete session (all cookies)
+    5. Future scraping will use this session
+    
+    Args:
+        wait_time: How long to wait for manual login (60-600 seconds, default 300)
+    
+    Steps:
+    1. Call this endpoint
+    2. Connect to VNC (localhost:5900)
+    3. Login to LinkedIn in the browser window
+    4. Complete any verification challenges
+    5. Wait for the timer to finish
+    6. Session will be saved automatically
+    """
+    log_operation_start(logger, "linkedin_vnc_login", wait_time=wait_time)
+    
+    try:
+        logger.info(f"🌐 Starting VNC manual login (waiting {wait_time}s)...")
+        
+        # Import and run the manual login script
+        from app.linkedin_manual_login import manual_login_session
+        
+        # Get credentials from settings (loaded from Infisical)
+        settings = get_settings()
+        email = settings.linkedin_email
+        password = settings.linkedin_password
+        
+        if not email or not password:
+            raise HTTPException(
+                status_code=500,
+                detail="LinkedIn credentials not found in settings"
+            )
+        
+        logger.info(f"🔑 Using credentials for: {email}")
+        
+        # Run in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        from concurrent.futures import ThreadPoolExecutor
+        executor = ThreadPoolExecutor(max_workers=1)
+        
+        await loop.run_in_executor(executor, manual_login_session, wait_time, email, password)
+        
+        log_operation_success(logger, "linkedin_vnc_login")
+        
+        return {
+            "success": True,
+            "message": f"Manual login session saved successfully!",
+            "wait_time": wait_time,
+            "next_steps": [
+                "Session is now saved with all cookies",
+                "You can now use the scraping endpoints",
+                "Session will be valid for ~30 days"
+            ]
+        }
+        
+    except Exception as e:
+        log_operation_error(logger, "linkedin_vnc_login", e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to complete VNC login: {str(e)}"
+        )
+
+
 @app.post("/linkedin/manual-setup")
 async def linkedin_manual_setup():
     """
@@ -987,9 +1577,9 @@ async def linkedin_manual_setup():
 
 
 @app.post("/linkedin/cookie-auth")
-async def linkedin_cookie_auth(li_at_cookie: str = Query(..., description="LinkedIn li_at cookie value")):
+async def linkedin_cookie_auth(auth_request: LinkedInCookieAuth):
     """
-    Authenticate with LinkedIn using li_at cookie.
+    Authenticate with LinkedIn using li_at cookie (Selenium-based).
     
     Alternative to manual setup - provide your li_at cookie directly.
     To get your li_at cookie:
@@ -998,24 +1588,25 @@ async def linkedin_cookie_auth(li_at_cookie: str = Query(..., description="Linke
     3. Copy the value of the 'li_at' cookie
     
     Args:
-        li_at_cookie: The li_at cookie value from your browser
+        auth_request: Request containing the li_at cookie value
     """
     log_operation_start(logger, "linkedin_cookie_auth")
     
-    linkedin = get_linkedin_service()
+    # Use Selenium implementation instead of Playwright
+    linkedin = get_selenium_linkedin_service()
     
     try:
-        logger.info("🔐 Authenticating with li_at cookie...")
+        logger.info("🔐 Authenticating with li_at cookie (Selenium)...")
         
-        result = await linkedin.login_with_cookies(li_at_cookie=li_at_cookie)
+        result = await linkedin.login_with_cookies(li_at_cookie=auth_request.li_at_cookie)
         
         if result["success"]:
             log_operation_success(logger, "linkedin_cookie_auth")
             
             return {
                 "success": True,
-                "message": "LinkedIn session established with cookie successfully!",
-                "session_file": result.get("session_file"),
+                "message": "LinkedIn session established with cookie successfully (Selenium)!",
+                "cookies_file": result.get("cookies_file"),
                 "next_steps": [
                     "Session is now saved and will be used for all future automated operations",
                     "You can now use the scraping and publishing endpoints"
@@ -1116,7 +1707,7 @@ async def linkedin_scrape(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Scrape posts from a LinkedIn user's profile.
+    Scrape posts from a LinkedIn user's profile using Selenium.
     
     This endpoint:
     1. Checks session health (blocks if expired)
@@ -1137,36 +1728,17 @@ async def linkedin_scrape(
     
     log_operation_start(logger, "linkedin_scrape", handle=handle, max_posts=max_posts, days_back=days_back)
     
-    linkedin = get_linkedin_service()
+    # Get credentials for login
+    settings = get_settings()
+    email = settings.linkedin_email
+    password = settings.linkedin_password
+    
+    # Use Selenium implementation with auto-login
+    linkedin = get_selenium_linkedin_service(email=email, password=password)
     
     try:
-        # Check session health first
-        health = linkedin.check_session_health()
-        
-        if health["status"] == "expired":
-            logger.error(f"❌ LinkedIn session expired - cannot scrape")
-            raise HTTPException(
-                status_code=403,
-                detail=f"LinkedIn session expired. Please refresh at {settings.app_base_url}/linkedin/manual-setup"
-            )
-        
-        if health["status"] == "warning":
-            logger.warning(f"⚠️  LinkedIn session expiring soon (age: {linkedin.get_session_age()} days)")
-        
-        # Start LinkedIn service
-        await linkedin.start()
-        
-        # Check if already logged in, otherwise use saved session
-        if not linkedin.is_logged_in:
-            login_success = await linkedin.login()
-            if not login_success:
-                raise HTTPException(
-                    status_code=401,
-                    detail="Failed to login with saved session. Please run /linkedin/manual-setup"
-                )
-        
         # Scrape posts with configured lookback
-        logger.info(f"🔍 Scraping posts from @{handle} (last {days_back} days)...")
+        logger.info(f"🔍 Scraping posts from @{handle} (last {days_back} days) with Selenium...")
         posts = await linkedin.scrape_user_posts(handle=handle, max_posts=max_posts, days_back=days_back)
         
         logger.info(f"✅ Scraped {len(posts)} posts from @{handle}")
@@ -1212,7 +1784,7 @@ async def linkedin_scrape(
             "handle": handle,
             "scraped_count": len(posts),
             "new_posts_count": new_posts_count,
-            "session_health": health["status"],
+            "session_health": "healthy",  # Always healthy with email/password login
             "posts": [
                 {
                     "author_name": p.author_name,
@@ -1233,6 +1805,166 @@ async def linkedin_scrape(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to scrape LinkedIn posts: {str(e)}"
+        )
+    finally:
+        await linkedin.stop()
+
+
+@app.post("/linkedin/repost/{post_id}")
+async def linkedin_repost(
+    post_id: int,
+    db: AsyncSession = Depends(get_db),
+    max_retries: int = Query(5, description="Maximum retry attempts"),
+    fuzzy_threshold: float = Query(0.80, description="Content similarity threshold (0-1)")
+):
+    """
+    Repost an approved LinkedIn post using the native repost button.
+    
+    This endpoint:
+    1. Verifies post is approved and has approved_variant_text
+    2. Searches for the original post by author + content (fuzzy match)
+    3. Clicks the repost button
+    4. Types the approved variant text as commentary
+    5. Submits the repost
+    6. Updates post status (POSTED, MISSING, or FAILED)
+    
+    Args:
+        post_id: ID of the approved post to repost
+        max_retries: Maximum number of retry attempts (default 5)
+        fuzzy_threshold: Content similarity threshold for finding post (default 0.80)
+    """
+    log_operation_start(logger, "linkedin_repost", post_id=post_id)
+    
+    # Import health monitoring
+    from app.health_monitor import update_last_successful_post, increment_failed_posts
+    
+    # Use Selenium service for reposting
+    settings = get_settings()
+    linkedin = get_selenium_linkedin_service(
+        headless=False,  # Run with display for VNC debugging
+        email=settings.linkedin_email,
+        password=settings.linkedin_password
+    )
+    
+    try:
+        # Get post from database
+        result = await db.execute(
+            select(LinkedInPost)
+            .where(LinkedInPost.id == post_id)
+        )
+        post = result.scalar_one_or_none()
+        
+        if not post:
+            raise HTTPException(status_code=404, detail=f"Post {post_id} not found")
+        
+        # Check post is approved
+        if post.status not in [PostStatus.APPROVED, PostStatus.QUEUED, PostStatus.MISSING]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Post {post_id} is not ready for reposting (status: {post.status.value})"
+            )
+        
+        # Check we have approved variant text
+        if not post.approved_variant_text:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Post {post_id} has no approved variant text"
+            )
+        
+        # Check retry count
+        if post.retry_count >= max_retries:
+            post.status = PostStatus.FAILED
+            post.error_message = f"Failed after {max_retries} retry attempts"
+            await db.commit()
+            
+            log_operation_error(
+                logger,
+                "linkedin_repost",
+                Exception(f"Max retries ({max_retries}) exceeded")
+            )
+            
+            await increment_failed_posts(db)
+            
+            raise HTTPException(
+                status_code=400,
+                detail=f"Post {post_id} exceeded max retries ({max_retries})"
+            )
+        
+        # Update status to POSTING
+        post.status = PostStatus.POSTING
+        post.retry_count += 1
+        await db.commit()
+        
+        logger.info(f"🔄 Attempting repost (attempt {post.retry_count}/{max_retries})...")
+        
+        # Attempt to repost
+        success = await linkedin.repost_with_variant(
+            author_handle=post.author_handle,
+            original_content=post.original_content,
+            variant_text=post.approved_variant_text,
+            fuzzy_threshold=fuzzy_threshold
+        )
+        
+        if success:
+            # Update post status to POSTED
+            post.status = PostStatus.POSTED
+            post.posted_at = datetime.utcnow()
+            post.error_message = None
+            await db.commit()
+            
+            # Update health monitoring
+            await update_last_successful_post(db)
+            
+            log_operation_success(logger, "linkedin_repost", post_id=post_id)
+            
+            return {
+                "success": True,
+                "message": f"Successfully reposted post {post_id}",
+                "post_id": post_id,
+                "status": post.status.value,
+                "posted_at": post.posted_at,
+                "retry_count": post.retry_count
+            }
+        else:
+            # Repost failed - mark as MISSING for retry
+            post.status = PostStatus.MISSING
+            post.error_message = f"Could not find original post (attempt {post.retry_count}/{max_retries})"
+            
+            # Lower priority for re-queuing
+            post.priority = max(0, post.priority - 20)
+            
+            await db.commit()
+            
+            log_operation_error(
+                logger,
+                "linkedin_repost",
+                Exception(f"Post not found (attempt {post.retry_count}/{max_retries})")
+            )
+            
+            return {
+                "success": False,
+                "message": f"Could not find original post (attempt {post.retry_count}/{max_retries})",
+                "post_id": post_id,
+                "status": post.status.value,
+                "retry_count": post.retry_count,
+                "max_retries": max_retries,
+                "will_retry": post.retry_count < max_retries
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Unexpected error - mark as FAILED
+        post.status = PostStatus.FAILED
+        post.error_message = f"Unexpected error: {str(e)}"
+        await db.commit()
+        
+        await increment_failed_posts(db)
+        
+        log_operation_error(logger, "linkedin_repost", e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to repost: {str(e)}"
         )
     finally:
         await linkedin.stop()

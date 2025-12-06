@@ -214,6 +214,18 @@ class ScheduleQueueResponse(BaseModel):
     queue: List[ScheduledPostResponse]
 
 
+# ============================================================================
+# LinkedIn Authentication Schemas
+# ============================================================================
+
+class LinkedInCookieAuth(BaseModel):
+    """Schema for LinkedIn cookie authentication."""
+    li_at_cookie: str = Field(
+        min_length=10,
+        description="The li_at cookie value from your LinkedIn browser session"
+    )
+
+
 # Resolve forward references
 LinkedInPostDetailResponse.model_rebuild()
 

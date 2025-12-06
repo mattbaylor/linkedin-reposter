@@ -6,6 +6,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 from pathlib import Path
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeout
+from playwright_stealth import stealth_async
 from app.config import get_settings
 from app.logging_config import (
     log_operation_start,
@@ -297,7 +298,7 @@ class LinkedInAutomation:
                         "No LinkedIn session found. Check your email for setup instructions."
                     )
             
-            # Launch browser
+            # Launch browser with additional evasion flags
             self.browser = await self.playwright.chromium.launch(
                 headless=self.headless,
                 args=[
@@ -305,7 +306,11 @@ class LinkedInAutomation:
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-blink-features=AutomationControlled',
-                ]
+                    '--disable-features=IsolateOrigins,site-per-process',
+                    '--disable-site-isolation-trials',
+                    '--disable-web-security',
+                ],
+                chromium_sandbox=False,
             )
             
             # Create browser context with saved session if available
@@ -325,6 +330,42 @@ class LinkedInAutomation:
             # Create a new page
             self.page = await self.context.new_page()
             
+            # Apply stealth mode to hide automation signals
+            await stealth_async(self.page)
+            logger.info("🥷 Stealth mode applied to page")
+            
+            # Additional JavaScript evasion techniques
+            await self.page.add_init_script("""
+                // Override navigator.webdriver
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+                
+                // Override chrome property
+                window.chrome = {
+                    runtime: {}
+                };
+                
+                // Override permissions
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Notification.permission }) :
+                        originalQuery(parameters)
+                );
+                
+                // Override plugins length
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
+                
+                // Override languages
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en']
+                });
+            """)
+            logger.info("🎭 Additional evasion scripts applied")
+            
             # Set extra HTTP headers to appear more human
             await self.page.set_extra_http_headers({
                 'Accept-Language': 'en-US,en;q=0.9',
@@ -332,19 +373,11 @@ class LinkedInAutomation:
             
             # Verify session is valid if requested
             if check_session and has_session:
-                is_valid = await self._check_logged_in()
-                if is_valid:
-                    logger.info("✅ Session is valid and logged in")
-                    self.is_logged_in = True
-                else:
-                    logger.error("❌ Session exists but is invalid/expired")
-                    
-                    # Send expired alert
-                    await self.send_session_alert('expired')
-                    
-                    raise Exception(
-                        "LinkedIn session is invalid. Check your email for refresh instructions."
-                    )
+                # For cookie-based sessions, skip the validation check
+                # LinkedIn blocks the /feed navigation with redirect loop
+                # We'll trust the cookie and detect issues during actual scraping
+                logger.info("✅ Session loaded from cookie - skipping validation to avoid detection")
+                self.is_logged_in = True
             
             log_operation_success(logger, "start_browser", has_session=has_session)
             
@@ -396,17 +429,20 @@ class LinkedInAutomation:
             # Start browser in non-headless mode
             await self.start(check_session=False)
             
-            logger.info("🖥️  Opening LinkedIn login page...")
+            logger.info("🖥️  Opening LinkedIn homepage...")
             logger.info(f"   You have {wait_time} seconds to complete login")
             
-            # Navigate to LinkedIn
-            await self.page.goto("https://www.linkedin.com/login", wait_until="networkidle")
+            # Navigate to LinkedIn homepage (not login page to avoid bot detection)
+            await self.page.goto("https://www.linkedin.com/", wait_until="domcontentloaded", timeout=60000)
+            
+            logger.info("✅ Page loaded - you can now manually navigate to login")
             
             # Wait for user to complete login
             logger.info("⏳ Waiting for manual login...")
-            logger.info("   1. Login with your credentials")
-            logger.info("   2. Complete any verification challenges")
-            logger.info("   3. Wait for the feed page to load")
+            logger.info("   1. Click 'Sign in' on the homepage")
+            logger.info("   2. Login with your credentials")
+            logger.info("   3. Complete any verification challenges")
+            logger.info("   4. Wait for the feed page to load")
             
             # Wait for feed or profile page (indicates successful login)
             try:
@@ -479,15 +515,20 @@ class LinkedInAutomation:
             
             logger.info("🍪 Cookie added to browser context")
             
-            # Just save the session - we'll verify it works during actual scraping
+            # Save the session - trust that the user's cookie is valid
+            # We'll verify it works during actual scraping, not here
             await self._save_session()
             logger.info("✅ Cookie saved to session file")
-            log_operation_success(logger, "login_with_cookies")
+            
+            # Mark as logged in without validation to avoid redirect loop
+            # The cookie from user's browser should be valid
             self.is_logged_in = True
+            
+            log_operation_success(logger, "login_with_cookies")
             
             return {
                 "success": True,
-                "message": "Cookie saved successfully",
+                "message": "Cookie saved successfully. Session will be validated during first use.",
                 "session_file": str(self.session_file)
             }
             
@@ -721,6 +762,15 @@ class LinkedInAutomation:
             with open(self.cookies_file, 'w') as f:
                 json.dump(cookies, f, indent=2)
             logger.info(f"✅ Cookies saved to {self.cookies_file}")
+            
+            # Save metadata with creation timestamp
+            metadata = {
+                'created_at': datetime.utcnow().isoformat(),
+                'updated_at': datetime.utcnow().isoformat()
+            }
+            with open(self.session_metadata_file, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            logger.info(f"✅ Session metadata saved to {self.session_metadata_file}")
             
         except Exception as e:
             logger.warning(f"⚠️  Failed to save session: {e}")

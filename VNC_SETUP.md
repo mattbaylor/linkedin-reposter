@@ -5,12 +5,32 @@
 Your LinkedIn Reposter container is now running with VNC support.
 
 **Connection Details:**
-- **Host**: `localhost` (or your Mac's IP if connecting from another device)
-- **Port**: `5900`
+- **VNC Server**: Port `5900` (for VNC clients like Jump Desktop)
+- **Web VNC**: Port `6080` (for browser-based access via noVNC)
 - **Password**: None (no password required)
 - **Display**: 1920x1080
 
+## Access Methods
+
+### Method 1: Web Browser (Recommended)
+
+**Local Access:**
+```
+http://localhost:8080/admin/vnc
+```
+
+**Production Access:**
+```
+https://liposter.example.com/admin/vnc
+```
+
+This opens a full-screen VNC session directly in your browser - no additional software needed!
+
+**Note**: For production access, you need to configure Caddy to proxy WebSocket connections (see Production Setup below).
+
 ## Step 1: Connect with Jump Desktop
+
+### Method 2: Jump Desktop (Alternative)
 
 1. Open **Jump Desktop** on your Mac
 2. Click **"+"** to add a new connection
@@ -22,6 +42,45 @@ Your LinkedIn Reposter container is now running with VNC support.
 5. Click **Connect**
 
 You should see a desktop with a gray/black background (Fluxbox window manager).
+
+## Production Setup (Caddy Configuration)
+
+For the web-based VNC to work in production, add this to your Caddyfile on TrueNAS:
+
+```caddy
+liposter.example.com {
+    # Regular HTTP proxy to FastAPI app
+    reverse_proxy localhost:8080
+    
+    # WebSocket proxy for noVNC (port 6080)
+    # This enables browser-based VNC access
+    @websocket {
+        path /websockify*
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    
+    handle @websocket {
+        reverse_proxy localhost:6080
+    }
+}
+```
+
+**Or simpler approach** - just proxy all traffic from 6080:
+```caddy
+liposter.example.com {
+    reverse_proxy localhost:8080
+    reverse_proxy /websockify* localhost:6080
+}
+```
+
+After updating Caddyfile:
+```bash
+# Reload Caddy on TrueNAS
+caddy reload --config /path/to/Caddyfile
+```
+
+Then test: `https://liposter.example.com/admin/vnc`
 
 ## Step 2: Run LinkedIn Manual Setup
 

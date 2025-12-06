@@ -156,25 +156,34 @@ REQUIREMENTS:
    - Variant 2: Enthusiastic and energetic
    - Variant 3: Conversational and approachable
 3. Keep the same hashtags or suggest similar relevant ones
-4. Maintain similar length to the original
+4. **IMPORTANT - SUMMARIZE**: Make the variants more concise than the original
+   - Focus on the key insight or takeaway
+   - Aim for 30-50% shorter than the original while keeping the main point
+   - Remove unnecessary details or repetition
 5. Preserve any emojis or use similar appropriate ones
 6. Each variant should feel authentic and engaging
-7. DO NOT include any meta-commentary, explanations, or labels like "Variant 1:", "Option 1:", etc.
-8. Separate each variant with exactly "---VARIANT---" on its own line
+7. **IMPORTANT - THIRD PERSON**: Convert first-person perspective to third-person perspective
+   - Reference the original poster by their FULL NAME: "{author_name}"
+   - Example: "I believe..." → "{author_name} believes..."
+   - Example: "In my experience..." → "In {author_name}'s experience..."
+   - Example: "I've seen..." → "{author_name} has seen..."
+   - Use their actual name (e.g., "Tim Cool", "Elena Dietrich"), NOT their handle (e.g., NOT "timcool" or "@timcool")
+8. DO NOT include any meta-commentary, explanations, or labels like "Variant 1:", "Option 1:", etc.
+9. Separate each variant with exactly "---VARIANT---" on its own line
 
 OUTPUT FORMAT:
 Return exactly {num_variants} variants separated by ---VARIANT--- markers, with no additional text, explanations, or labels.
 
 Example output format:
-This is the first variant text here.
+This is the first concise variant text here referencing {author_name}.
 
 #Hashtag1 #Hashtag2
 ---VARIANT---
-This is the second variant text here.
+This is the second summarized variant text here with {author_name}'s perspective.
 
 #Hashtag1 #Hashtag2
 ---VARIANT---
-This is the third variant text here.
+This is the third condensed variant text here about what {author_name} thinks.
 
 #Hashtag1 #Hashtag2
 
