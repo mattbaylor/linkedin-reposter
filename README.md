@@ -17,6 +17,8 @@ Automated LinkedIn post monitoring and reposting service with AI-powered content
 - 🐳 Fully containerized with Docker
 - 🏗️ Multi-architecture support (arm64 + amd64) via GitHub Actions
 
+<img width="1505" height="1609" alt="image" src="https://github.com/user-attachments/assets/53cdd63e-252f-4a26-8892-db0bf4c90ecd" />
+
 ## Architecture
 
 ```
