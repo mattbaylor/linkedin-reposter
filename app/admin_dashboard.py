@@ -403,6 +403,7 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                         <option value="">All Authors</option>
                     </select>
                 </label>
+                <button onclick="triggerScrape()" class="btn btn-primary btn-sm">🔍 Scrape Now</button>
                 <button onclick="window.location.reload()" class="btn btn-primary btn-sm">🔄 Refresh</button>
             </div>
             
@@ -503,6 +504,30 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                 if (status) params.set('status', status);
                 if (author) params.set('author', author);
                 window.location.href = '/admin/dashboard?' + params.toString();
+            }}
+            
+            async function triggerScrape() {{
+                if (!confirm('🔍 Trigger a manual scrape of all LinkedIn handles?\\n\\nThis will scrape all monitored profiles and generate AI variants. The process may take a few minutes.')) return;
+                
+                document.body.style.cursor = 'wait';
+                
+                try {{
+                    const response = await fetch('/admin/trigger-scrape', {{
+                        method: 'POST'
+                    }});
+                    
+                    if (response.ok) {{
+                        const data = await response.json();
+                        alert('✅ ' + data.message);
+                    }} else {{
+                        const error = await response.json();
+                        alert('❌ Error: ' + (error.detail || 'Failed to trigger scrape'));
+                    }}
+                }} catch (err) {{
+                    alert('❌ Network error: ' + err.message);
+                }} finally {{
+                    document.body.style.cursor = 'default';
+                }}
             }}
         </script>
     </body>

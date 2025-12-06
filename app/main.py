@@ -919,6 +919,22 @@ async def admin_delete_post(
     return {"success": True, "message": "Post deleted"}
 
 
+@app.post("/admin/trigger-scrape")
+async def admin_trigger_scrape(db: AsyncSession = Depends(get_db)):
+    """Manually trigger a scrape of all monitored LinkedIn handles."""
+    log_operation_start(logger, "admin_trigger_scrape")
+    
+    # Run the scrape in the background so we can return immediately
+    asyncio.create_task(scheduled_scrape_and_process())
+    
+    log_operation_success(logger, "admin_trigger_scrape", status="started")
+    
+    return {
+        "success": True,
+        "message": "Scrape started! Check the dashboard in a few minutes for new posts."
+    }
+
+
 @app.get("/stats", response_model=StatsResponse)
 async def get_stats(db: AsyncSession = Depends(get_db)):
     """Get statistics about posts and processing."""
