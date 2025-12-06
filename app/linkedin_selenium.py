@@ -736,11 +736,11 @@ Alternative: Connect via VNC client to localhost:5900
                         logger.debug(f"⚠️  Skipping post {idx+1} - no substantial content")
                         continue
                     
-                    # Extract author name from the profile page
-                    # Try to find the h1 tag with the person's name or company name
-                    author_name = handle  # Default to the handle
+                    # Extract author name from the profile page or post metadata
+                    # Default to formatted handle if we can't find the name
+                    author_name = handle.replace('-', ' ').replace('company/', '').title()
                     
-                    # Look for profile name in page
+                    # Strategy 1: Look for profile name in the page header (h1)
                     name_header = soup.find('h1', class_=lambda c: c and 'text-heading-xlarge' in c)
                     if not name_header:
                         # Alternative: try company name
@@ -748,9 +748,20 @@ Alternative: Connect via VNC client to localhost:5900
                     
                     if name_header:
                         extracted_name = name_header.get_text(strip=True)
-                        if extracted_name and len(extracted_name) > 0:
+                        if extracted_name and len(extracted_name) > 3:  # Minimum length check
                             author_name = extracted_name
-                            logger.debug(f"   📝 Extracted author name: {author_name}")
+                            logger.debug(f"   📝 Extracted author name from header: {author_name}")
+                    else:
+                        # Strategy 2: Look for the author name in the post metadata
+                        # Posts usually have the author name in a span or link near the top
+                        author_link = soup.find('a', class_=lambda c: c and 'app-aware-link' in c)
+                        if author_link:
+                            potential_name = author_link.get_text(strip=True)
+                            if potential_name and len(potential_name) > 3 and potential_name.lower() != handle.lower():
+                                author_name = potential_name
+                                logger.debug(f"   📝 Extracted author name from link: {author_name}")
+                        else:
+                            logger.debug(f"   📝 Using formatted handle as name: {author_name}")
                     
                     # EXTRACT UNIQUE POST URL - Look for activity URN
                     post_url = None
