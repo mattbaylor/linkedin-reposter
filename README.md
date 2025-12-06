@@ -66,7 +66,7 @@ INFISICAL_TOKEN=st.xxxx.yyyy.zzzz  # Your Service Token from Infisical
 INFISICAL_PROJECT_ID=LinkedInReposter
 INFISICAL_ENVIRONMENT=dev
 
-# Machine Identity for Copilot token sync
+# Machine Identity for Copilot token sync (get from Infisical)
 OPENCODE_INFISICAL_PROJECT_ID=your-opencode-project-id
 INFISICAL_MACHINE_IDENTITY_CLIENT_ID=your-machine-identity-client-id
 INFISICAL_MACHINE_IDENTITY_CLIENT_SECRET=your-machine-identity-client-secret
