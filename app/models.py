@@ -1,7 +1,7 @@
 """SQLAlchemy database models for LinkedIn Reposter."""
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
-from sqlalchemy import String, Text, DateTime, Boolean, ForeignKey, Integer, Enum as SQLEnum
+from sqlalchemy import String, Text, DateTime, Boolean, ForeignKey, Integer, Enum as SQLEnum, UniqueConstraint, Index
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 import enum
 
@@ -45,6 +45,11 @@ class ScheduledPostStatus(str, enum.Enum):
 class LinkedInPost(Base):
     """Original LinkedIn post scraped from monitored handles."""
     __tablename__ = "linkedin_posts"
+    __table_args__ = (
+        # Unique constraint on original_post_url where not null
+        Index('idx_unique_post_url', 'original_post_url', unique=True, 
+              sqlite_where='original_post_url IS NOT NULL'),
+    )
     
     id: Mapped[int] = mapped_column(primary_key=True)
     
@@ -57,7 +62,7 @@ class LinkedInPost(Base):
     original_content: Mapped[str] = mapped_column(Text)
     
     # Metadata
-    scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    scraped_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     original_post_date: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     
     # Status tracking
@@ -120,7 +125,7 @@ class PostVariant(Base):
     )
     
     # Metadata
-    generated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    generated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     
@@ -152,7 +157,7 @@ class ApprovalRequest(Base):
     approval_token: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     
     # Email tracking
-    email_sent_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    email_sent_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     email_message_id: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     
     # Response tracking
@@ -182,7 +187,7 @@ class ApprovalRequest(Base):
         """Check if approval request has expired."""
         if self.expires_at is None:
             return False
-        return datetime.utcnow() > self.expires_at
+        return datetime.now(timezone.utc) > self.expires_at
     
     @property
     def is_pending(self) -> bool:
@@ -193,6 +198,10 @@ class ApprovalRequest(Base):
 class ScheduledPost(Base):
     """Post scheduled for future publishing with intelligent spacing."""
     __tablename__ = "scheduled_posts"
+    __table_args__ = (
+        # Prevent duplicate scheduling of same post/variant combination
+        UniqueConstraint('post_id', 'variant_id', name='uq_scheduled_post_variant'),
+    )
     
     id: Mapped[int] = mapped_column(primary_key=True)
     
@@ -203,7 +212,7 @@ class ScheduledPost(Base):
     variant_id: Mapped[int] = mapped_column(ForeignKey("post_variants.id"), index=True)
     
     # Scheduling information
-    approved_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    approved_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     scheduled_for: Mapped[datetime] = mapped_column(DateTime, index=True)
     published_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     
@@ -224,7 +233,7 @@ class ScheduledPost(Base):
     post_age_hours: Mapped[Optional[float]] = mapped_column(nullable=True)            # Age when scheduled
     
     # Metadata
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     
     # Relationships
     post: Mapped["LinkedInPost"] = relationship("LinkedInPost")
@@ -254,7 +263,11 @@ class SystemHealth(Base):
     total_posts_failed: Mapped[int] = mapped_column(Integer, default=0)
     
     # Metadata
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, 
+        default=lambda: datetime.now(timezone.utc), 
+        onupdate=lambda: datetime.now(timezone.utc)
+    )
     
     def __repr__(self) -> str:
         return f"<SystemHealth(last_post={self.last_successful_post_time}, scraped={self.total_posts_scraped}, posted={self.total_posts_posted})>"

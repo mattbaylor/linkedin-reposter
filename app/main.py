@@ -2,7 +2,7 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response, HTMLResponse
@@ -66,7 +66,7 @@ async def check_and_publish_posts():
         async for db in get_db():
             try:
                 # Find posts due for publishing
-                now = datetime.now()
+                now = datetime.now(timezone.utc)
                 
                 result = await db.execute(
                     select(ScheduledPost)
@@ -143,11 +143,11 @@ async def check_and_publish_posts():
                             if success:
                                 # Update scheduled post status
                                 scheduled_post.status = ScheduledPostStatus.PUBLISHED
-                                scheduled_post.published_at = datetime.now()
+                                scheduled_post.published_at = datetime.now(timezone.utc)
                                 
                                 # Update original post status
                                 post.status = PostStatus.POSTED
-                                post.posted_at = datetime.now()
+                                post.posted_at = datetime.now(timezone.utc)
                                 post.error_message = None
                                 
                                 # Update health monitoring
@@ -1077,7 +1077,7 @@ async def scrub_schedule_internal(db: AsyncSession):
     # Step 4: Reschedule all posts with proper spacing and priority order
     # Start from the earliest currently scheduled time or now (whichever is later)
     earliest_time = min(p.scheduled_for for p in scheduled_posts)
-    start_time = max(earliest_time, datetime.now())
+    start_time = max(earliest_time, datetime.now(timezone.utc))
     
     current_time = scheduler._normalize_to_posting_hours(start_time)
     
@@ -1449,8 +1449,7 @@ async def approve_webhook(
     )
     
     # Calculate time until posting
-    from datetime import datetime
-    time_until = (scheduled_time - datetime.now()).total_seconds() / 60
+    time_until = (scheduled_time - datetime.now(timezone.utc)).total_seconds() / 60
     if time_until < 60:
         time_str = f"{time_until:.0f} minutes"
     elif time_until < 1440:
@@ -2702,7 +2701,7 @@ async def get_schedule_queue(db: AsyncSession = Depends(get_db)):
         total_scheduled = len(scheduled_posts)
         pending_count = total_scheduled
         
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         today_end = now.replace(hour=23, minute=59, second=59)
         week_end = now + timedelta(days=7)
         
@@ -2791,7 +2790,7 @@ async def reschedule_post(
             )
         
         # Validate new time is in the future
-        if new_time <= datetime.now():
+        if new_time <= datetime.now(timezone.utc):
             raise HTTPException(
                 status_code=400,
                 detail="New scheduled time must be in the future"

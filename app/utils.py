@@ -1,4 +1,5 @@
 """Utility functions for LinkedIn Reposter."""
+import asyncio
 import random
 import time
 from difflib import SequenceMatcher
@@ -61,6 +62,9 @@ def random_delay(min_seconds: float = 1.0, max_seconds: float = 3.0) -> None:
     """
     Sleep for a random amount of time to simulate human behavior.
     
+    NOTE: This is a blocking sleep for use in synchronous contexts (e.g., Selenium threadpool).
+    For async code, use async_random_delay instead.
+    
     Args:
         min_seconds: Minimum delay in seconds
         max_seconds: Maximum delay in seconds
@@ -70,30 +74,72 @@ def random_delay(min_seconds: float = 1.0, max_seconds: float = 3.0) -> None:
     time.sleep(delay)
 
 
+async def async_random_delay(min_seconds: float = 1.0, max_seconds: float = 3.0) -> None:
+    """
+    Async sleep for a random amount of time to simulate human behavior.
+    
+    Use this in async contexts to avoid blocking the event loop.
+    
+    Args:
+        min_seconds: Minimum delay in seconds
+        max_seconds: Maximum delay in seconds
+    """
+    delay = random.uniform(min_seconds, max_seconds)
+    logger.debug(f"Async random delay: {delay:.2f}s")
+    await asyncio.sleep(delay)
+
+
 def random_short_delay() -> None:
-    """Quick random delay (0.5-1.5 seconds)."""
+    """Quick random delay (0.5-1.5 seconds). For sync contexts only."""
     random_delay(0.5, 1.5)
 
 
+async def async_random_short_delay() -> None:
+    """Quick random delay (0.5-1.5 seconds). For async contexts."""
+    await async_random_delay(0.5, 1.5)
+
+
 def random_medium_delay() -> None:
-    """Medium random delay (2-4 seconds)."""
+    """Medium random delay (2-4 seconds). For sync contexts only."""
     random_delay(2.0, 4.0)
 
 
+async def async_random_medium_delay() -> None:
+    """Medium random delay (2-4 seconds). For async contexts."""
+    await async_random_delay(2.0, 4.0)
+
+
 def random_long_delay() -> None:
-    """Long random delay (5-8 seconds)."""
+    """Long random delay (5-8 seconds). For sync contexts only."""
     random_delay(5.0, 8.0)
 
+
+async def async_random_long_delay() -> None:
+    """Long random delay (5-8 seconds). For async contexts."""
+    await async_random_delay(5.0, 8.0)
 
 def random_profile_delay() -> None:
     """
     Very long random delay for between-profile scraping (1-3 minutes).
     Makes scraping behavior appear more human by adding realistic pauses.
+    For sync contexts only.
     """
     delay_seconds = random.uniform(60.0, 180.0)  # 1-3 minutes
     delay_minutes = delay_seconds / 60
     logger.info(f"⏳ Human-like delay before next profile: {delay_minutes:.1f} minutes")
     random_delay(delay_seconds, delay_seconds)
+
+
+async def async_random_profile_delay() -> None:
+    """
+    Very long random delay for between-profile scraping (1-3 minutes).
+    Makes scraping behavior appear more human by adding realistic pauses.
+    For async contexts.
+    """
+    delay_seconds = random.uniform(60.0, 180.0)  # 1-3 minutes
+    delay_minutes = delay_seconds / 60
+    logger.info(f"⏳ Human-like delay before next profile: {delay_minutes:.1f} minutes")
+    await async_random_delay(delay_seconds, delay_seconds)
 
 
 def human_typing_delay() -> float:
@@ -159,8 +205,13 @@ def random_scroll_amount() -> int:
 
 
 def human_scroll_delay() -> None:
-    """Delay between scroll actions (0.8-2.0 seconds)."""
+    """Delay between scroll actions (0.8-2.0 seconds). For sync contexts only."""
     random_delay(0.8, 2.0)
+
+
+async def async_human_scroll_delay() -> None:
+    """Delay between scroll actions (0.8-2.0 seconds). For async contexts."""
+    await async_random_delay(0.8, 2.0)
 
 
 # ============================================================================

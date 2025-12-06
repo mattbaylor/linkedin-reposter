@@ -112,9 +112,9 @@ def load_config() -> Settings:
                 attr_name = secret_mapping[key]
                 setattr(settings, attr_name, value)
                 loaded_count += 1
-                # Mask sensitive values in logs
-                if "password" in key.lower() or "token" in key.lower() or "key" in key.lower():
-                    display_value = f"{value[:8]}..." if len(value) > 8 else "***"
+                # Always mask sensitive values in logs
+                if any(sensitive in key.lower() for sensitive in ['password', 'token', 'key', 'secret']):
+                    display_value = "***MASKED***"
                 else:
                     display_value = value
                 print(f"   ✓ {key}: {display_value}")
@@ -158,7 +158,7 @@ def load_config() -> Settings:
                         attr_name = copilot_mapping[key]
                         setattr(settings, attr_name, value)
                         copilot_count += 1
-                        display_value = f"{value[:8]}..." if len(value) > 8 else "***"
+                        display_value = "***MASKED***"
                         print(f"   ✓ {key}: {display_value}")
                 
                 if copilot_count > 0:
