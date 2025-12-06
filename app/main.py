@@ -1,6 +1,7 @@
 """Application entry point with FastAPI."""
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
@@ -43,7 +44,13 @@ from app.logging_config import (
 )
 
 # Setup enhanced logging
-setup_logging(log_level="INFO", log_file="/app/data/linkedin_reposter.log")
+# Use JSON format in production (set USE_JSON_LOGGING=true in environment)
+use_json_logging = os.getenv("USE_JSON_LOGGING", "false").lower() == "true"
+setup_logging(
+    log_level="INFO", 
+    log_file="/app/data/linkedin_reposter.log",
+    use_json=use_json_logging
+)
 logger = logging.getLogger(__name__)
 
 
@@ -515,37 +522,58 @@ app = FastAPI(
 )
 
 # Mount noVNC static files for web-based VNC access
-import os
 if os.path.exists("/app/static/novnc"):
     app.mount("/novnc", StaticFiles(directory="/app/static/novnc"), name="novnc")
     logger.info("✅ noVNC static files mounted at /novnc")
 
 
-# Request logging middleware
+# Request logging middleware with correlation IDs
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log all HTTP requests with timing."""
-    start_time = time.time()
+    """Log all HTTP requests with timing and correlation ID."""
+    import uuid
+    from app.logging_config import request_id_var
     
-    # Log request
-    logger.info(f"🌐 {request.method} {request.url.path}")
-    logger.debug(f"   Query params: {dict(request.query_params)}")
-    logger.debug(f"   Client: {request.client.host if request.client else 'unknown'}")
+    # Generate or extract correlation ID
+    request_id = request.headers.get('X-Request-ID', str(uuid.uuid4()))
     
-    # Process request
+    # Set in context for this request
+    token = request_id_var.set(request_id)
+    
     try:
-        response = await call_next(request)
-        duration = time.time() - start_time
+        start_time = time.time()
         
-        # Log response
-        logger.info(f"✅ {request.method} {request.url.path} → {response.status_code} ({duration:.2f}s)")
+        # Log request
+        logger.info(f"🌐 {request.method} {request.url.path} [request_id={request_id}]")
+        logger.debug(f"   Query params: {dict(request.query_params)}")
+        logger.debug(f"   Client: {request.client.host if request.client else 'unknown'}")
         
-        return response
-        
-    except Exception as e:
-        duration = time.time() - start_time
-        logger.error(f"❌ {request.method} {request.url.path} → Error ({duration:.2f}s): {e}")
-        raise
+        # Process request
+        try:
+            response = await call_next(request)
+            duration = time.time() - start_time
+            
+            # Add correlation ID to response headers
+            response.headers['X-Request-ID'] = request_id
+            
+            # Log response
+            logger.info(
+                f"✅ {request.method} {request.url.path} → {response.status_code} "
+                f"({duration:.2f}s) [request_id={request_id}]"
+            )
+            
+            return response
+            
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(
+                f"❌ {request.method} {request.url.path} → Error ({duration:.2f}s): {e} "
+                f"[request_id={request_id}]"
+            )
+            raise
+    finally:
+        # Reset context
+        request_id_var.reset(token)
 
 
 @app.get("/")
