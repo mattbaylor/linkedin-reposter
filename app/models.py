@@ -47,6 +47,8 @@ class LinkedInPost(Base):
     __tablename__ = "linkedin_posts"
     __table_args__ = (
         # Unique constraint on original_post_url where not null
+        # Note: sqlite_where is SQLite-specific syntax, appropriate for this project
+        # which uses SQLite as its database (see database.py)
         Index('idx_unique_post_url', 'original_post_url', unique=True, 
               sqlite_where='original_post_url IS NOT NULL'),
     )
