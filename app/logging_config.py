@@ -1,8 +1,13 @@
 """Enhanced logging configuration for LinkedIn Reposter."""
+import json
 import logging
 import sys
-from typing import Optional
+from typing import Optional, Any, Dict
 from datetime import datetime
+import contextvars
+
+# Context variable for request correlation ID
+request_id_var = contextvars.ContextVar('request_id', default=None)
 
 
 class ColoredFormatter(logging.Formatter):
@@ -38,16 +43,75 @@ class ColoredFormatter(logging.Formatter):
         record.color = color
         record.reset = reset
         
+        # Add request ID if available
+        request_id = request_id_var.get()
+        record.request_id = request_id if request_id else ''
+        
         return super().format(record)
 
 
-def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None) -> None:
+class JsonFormatter(logging.Formatter):
+    """JSON formatter for production logging with structured output."""
+    
+    def format(self, record: logging.LogRecord) -> str:
+        """Format log record as JSON."""
+        from datetime import timezone
+        
+        # Base log data
+        log_data: Dict[str, Any] = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'level': record.levelname,
+            'logger': record.name,
+            'message': record.getMessage(),
+            'module': record.module,
+            'function': record.funcName,
+            'line': record.lineno,
+        }
+        
+        # Add request ID if available
+        request_id = request_id_var.get()
+        if request_id:
+            log_data['request_id'] = request_id
+        
+        # Add exception info if present
+        if record.exc_info:
+            log_data['exception'] = {
+                'type': record.exc_info[0].__name__ if record.exc_info[0] else None,
+                'message': str(record.exc_info[1]) if record.exc_info[1] else None,
+                'traceback': self.formatException(record.exc_info) if record.exc_info else None
+            }
+        
+        # Add any extra fields (but exclude internal logging fields)
+        excluded_keys = {
+            'name', 'msg', 'args', 'created', 'filename', 'funcName', 
+            'levelname', 'levelno', 'lineno', 'module', 'msecs', 'message',
+            'pathname', 'process', 'processName', 'relativeCreated', 'thread',
+            'threadName', 'exc_info', 'exc_text', 'stack_info', 'taskName'
+        }
+        
+        for key, value in record.__dict__.items():
+            if key not in excluded_keys and not key.startswith('_'):
+                # Sanitize sensitive data
+                if any(sensitive in key.lower() for sensitive in ['password', 'token', 'key', 'secret']):
+                    log_data[key] = '***MASKED***'
+                else:
+                    log_data[key] = value
+        
+        return json.dumps(log_data, default=str)
+
+
+def setup_logging(
+    log_level: str = "INFO", 
+    log_file: Optional[str] = None,
+    use_json: bool = False
+) -> None:
     """
     Configure application-wide logging.
     
     Args:
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
         log_file: Optional file path to write logs to
+        use_json: Whether to use JSON format for logs (for production)
     """
     # Get root logger
     root_logger = logging.getLogger()
@@ -56,15 +120,24 @@ def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None) -> No
     # Remove existing handlers
     root_logger.handlers.clear()
     
-    # Console handler with colors
+    # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(getattr(logging, log_level.upper()))
     
-    console_format = '%(color)s%(emoji)s %(asctime)s - %(name)s - %(levelname)s%(reset)s - %(message)s'
-    console_formatter = ColoredFormatter(
-        console_format,
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
+    if use_json:
+        # JSON format for production
+        console_formatter = JsonFormatter()
+    else:
+        # Colored format for development
+        console_format = '%(color)s%(emoji)s %(asctime)s - %(name)s - %(levelname)s%(reset)s'
+        if request_id_var.get():
+            console_format += ' [%(request_id)s]'
+        console_format += ' - %(message)s'
+        console_formatter = ColoredFormatter(
+            console_format,
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+    
     console_handler.setFormatter(console_formatter)
     root_logger.addHandler(console_handler)
     
@@ -73,11 +146,20 @@ def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None) -> No
         file_handler = logging.FileHandler(log_file)
         file_handler.setLevel(logging.DEBUG)  # Always log everything to file
         
-        file_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        file_formatter = logging.Formatter(
-            file_format,
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
+        if use_json:
+            # JSON format for easier parsing
+            file_formatter = JsonFormatter()
+        else:
+            # Plain text format
+            file_format = '%(asctime)s - %(name)s - %(levelname)s'
+            if request_id_var.get():
+                file_format += ' [%(request_id)s]'
+            file_format += ' - %(message)s'
+            file_formatter = logging.Formatter(
+                file_format,
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+        
         file_handler.setFormatter(file_formatter)
         root_logger.addHandler(file_handler)
     

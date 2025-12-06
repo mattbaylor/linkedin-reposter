@@ -5,6 +5,10 @@
 FROM python:3.11-slim-bullseye AS base
 
 # Install system dependencies for Playwright, Selenium, and VNC
+# Security Note: Chromium and ChromeDriver versions are from Debian Bullseye repos
+# - For production, consider pinning specific versions via apt or using binary downloads
+# - Current: chromium from debian stable (updated via apt-get update)
+# - Playwright: Installs its own pinned Chromium version (see playwright install below)
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -50,10 +54,16 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Install Playwright browsers
+# Security Note: Playwright installs specific pinned browser versions
+# - Chromium version is determined by the playwright version in requirements.txt
+# - Current: Playwright 1.49.1 (see requirements.txt)
+# - To update: bump playwright version and rebuild image
 RUN playwright install chromium && \
     playwright install-deps chromium
 
 # Download and install noVNC for web-based VNC access
+# Security Note: noVNC version is pinned to v1.4.0
+# - To update: change version tag and rebuild image
 RUN wget https://github.com/novnc/noVNC/archive/refs/tags/v1.4.0.tar.gz && \
     tar xzf v1.4.0.tar.gz && \
     mkdir -p /app/static && \

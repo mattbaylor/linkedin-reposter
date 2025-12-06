@@ -1,8 +1,9 @@
 """Application entry point with FastAPI."""
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response, HTMLResponse
@@ -43,7 +44,13 @@ from app.logging_config import (
 )
 
 # Setup enhanced logging
-setup_logging(log_level="INFO", log_file="/app/data/linkedin_reposter.log")
+# Use JSON format in production (set USE_JSON_LOGGING=true in environment)
+use_json_logging = os.getenv("USE_JSON_LOGGING", "false").lower() == "true"
+setup_logging(
+    log_level="INFO", 
+    log_file="/app/data/linkedin_reposter.log",
+    use_json=use_json_logging
+)
 logger = logging.getLogger(__name__)
 
 
@@ -66,7 +73,7 @@ async def check_and_publish_posts():
         async for db in get_db():
             try:
                 # Find posts due for publishing
-                now = datetime.now()
+                now = datetime.now(timezone.utc)
                 
                 result = await db.execute(
                     select(ScheduledPost)
@@ -143,11 +150,11 @@ async def check_and_publish_posts():
                             if success:
                                 # Update scheduled post status
                                 scheduled_post.status = ScheduledPostStatus.PUBLISHED
-                                scheduled_post.published_at = datetime.now()
+                                scheduled_post.published_at = datetime.now(timezone.utc)
                                 
                                 # Update original post status
                                 post.status = PostStatus.POSTED
-                                post.posted_at = datetime.now()
+                                post.posted_at = datetime.now(timezone.utc)
                                 post.error_message = None
                                 
                                 # Update health monitoring
@@ -515,37 +522,58 @@ app = FastAPI(
 )
 
 # Mount noVNC static files for web-based VNC access
-import os
 if os.path.exists("/app/static/novnc"):
     app.mount("/novnc", StaticFiles(directory="/app/static/novnc"), name="novnc")
     logger.info("✅ noVNC static files mounted at /novnc")
 
 
-# Request logging middleware
+# Request logging middleware with correlation IDs
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log all HTTP requests with timing."""
-    start_time = time.time()
+    """Log all HTTP requests with timing and correlation ID."""
+    import uuid
+    from app.logging_config import request_id_var
     
-    # Log request
-    logger.info(f"🌐 {request.method} {request.url.path}")
-    logger.debug(f"   Query params: {dict(request.query_params)}")
-    logger.debug(f"   Client: {request.client.host if request.client else 'unknown'}")
+    # Generate or extract correlation ID
+    request_id = request.headers.get('X-Request-ID', str(uuid.uuid4()))
     
-    # Process request
+    # Set in context for this request
+    token = request_id_var.set(request_id)
+    
     try:
-        response = await call_next(request)
-        duration = time.time() - start_time
+        start_time = time.time()
         
-        # Log response
-        logger.info(f"✅ {request.method} {request.url.path} → {response.status_code} ({duration:.2f}s)")
+        # Log request
+        logger.info(f"🌐 {request.method} {request.url.path} [request_id={request_id}]")
+        logger.debug(f"   Query params: {dict(request.query_params)}")
+        logger.debug(f"   Client: {request.client.host if request.client else 'unknown'}")
         
-        return response
-        
-    except Exception as e:
-        duration = time.time() - start_time
-        logger.error(f"❌ {request.method} {request.url.path} → Error ({duration:.2f}s): {e}")
-        raise
+        # Process request
+        try:
+            response = await call_next(request)
+            duration = time.time() - start_time
+            
+            # Add correlation ID to response headers
+            response.headers['X-Request-ID'] = request_id
+            
+            # Log response
+            logger.info(
+                f"✅ {request.method} {request.url.path} → {response.status_code} "
+                f"({duration:.2f}s) [request_id={request_id}]"
+            )
+            
+            return response
+            
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(
+                f"❌ {request.method} {request.url.path} → Error ({duration:.2f}s): {e} "
+                f"[request_id={request_id}]"
+            )
+            raise
+    finally:
+        # Reset context
+        request_id_var.reset(token)
 
 
 @app.get("/")
@@ -1077,7 +1105,7 @@ async def scrub_schedule_internal(db: AsyncSession):
     # Step 4: Reschedule all posts with proper spacing and priority order
     # Start from the earliest currently scheduled time or now (whichever is later)
     earliest_time = min(p.scheduled_for for p in scheduled_posts)
-    start_time = max(earliest_time, datetime.now())
+    start_time = max(earliest_time, datetime.now(timezone.utc))
     
     current_time = scheduler._normalize_to_posting_hours(start_time)
     
@@ -1449,8 +1477,7 @@ async def approve_webhook(
     )
     
     # Calculate time until posting
-    from datetime import datetime
-    time_until = (scheduled_time - datetime.now()).total_seconds() / 60
+    time_until = (scheduled_time - datetime.now(timezone.utc)).total_seconds() / 60
     if time_until < 60:
         time_str = f"{time_until:.0f} minutes"
     elif time_until < 1440:
@@ -2702,7 +2729,7 @@ async def get_schedule_queue(db: AsyncSession = Depends(get_db)):
         total_scheduled = len(scheduled_posts)
         pending_count = total_scheduled
         
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         today_end = now.replace(hour=23, minute=59, second=59)
         week_end = now + timedelta(days=7)
         
@@ -2791,7 +2818,7 @@ async def reschedule_post(
             )
         
         # Validate new time is in the future
-        if new_time <= datetime.now():
+        if new_time <= datetime.now(timezone.utc):
             raise HTTPException(
                 status_code=400,
                 detail="New scheduled time must be in the future"

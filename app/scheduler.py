@@ -1,7 +1,7 @@
 """Intelligent post scheduling to avoid overwhelming LinkedIn algorithm."""
 import logging
 import random
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from typing import List, Optional
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -111,26 +111,41 @@ class PostScheduler:
                 last_scheduled = max(post.scheduled_for for post in scheduled_posts)
                 candidate_time = last_scheduled + timedelta(minutes=self.min_spacing_minutes)
             else:
-                candidate_time = datetime.now()
+                candidate_time = datetime.now(timezone.utc)
             logger.info(f"⚠️  STALE post - adding to back of queue")
             candidate_time = self._find_normal_slot(scheduled_posts, candidate_time, priority['level'])
         else:
             # GOOD or OK: Normal scheduling from now
-            candidate_time = datetime.now()
+            candidate_time = datetime.now(timezone.utc)
             logger.info(f"{'✅ GOOD' if priority['level'] == 'GOOD' else '⏰ OK'} timing - normal scheduling")
             candidate_time = self._find_normal_slot(scheduled_posts, candidate_time, priority['level'])
         
-        # Add jitter for natural appearance
+        # Add jitter for natural appearance, but clamp to posting hours
         if self.enable_jitter:
             jitter = random.randint(-self.jitter_minutes, self.jitter_minutes)
-            candidate_time = candidate_time + timedelta(minutes=jitter)
-            logger.debug(f"   Applied jitter: {jitter:+d} minutes")
+            jittered_time = candidate_time + timedelta(minutes=jitter)
+            
+            # Clamp jitter to not violate posting window
+            jittered_time = self._normalize_to_posting_hours(jittered_time)
+            
+            # Ensure jitter doesn't violate minimum spacing
+            last_post_time = self._get_last_scheduled_time_before(scheduled_posts, jittered_time)
+            if last_post_time:
+                time_diff = (jittered_time - last_post_time).total_seconds() / 60
+                if time_diff < self.min_spacing_minutes:
+                    # Adjust forward to maintain spacing
+                    jittered_time = last_post_time + timedelta(minutes=self.min_spacing_minutes)
+                    logger.debug(f"   Jitter adjusted to maintain spacing")
+            
+            candidate_time = jittered_time
+            logger.debug(f"   Applied jitter: {jitter:+d} minutes (clamped to posting hours)")
         
         # Create scheduled post entry with priority information
+        now_utc = datetime.now(timezone.utc)
         scheduled_post = ScheduledPost(
             post_id=post_id,
             variant_id=variant_id,
-            approved_at=datetime.now(),
+            approved_at=now_utc,
             scheduled_for=candidate_time,
             status=ScheduledPostStatus.PENDING,
             priority_level=priority['level'],
@@ -143,50 +158,7 @@ class PostScheduler:
         await db.refresh(scheduled_post)
         
         # Log with priority context
-        time_until = (candidate_time - datetime.now()).total_seconds() / 60
-        if time_until < 60:
-            time_str = f"{time_until:.0f} minutes"
-        elif time_until < 1440:
-            time_str = f"{time_until/60:.1f} hours"
-        else:
-            time_str = f"{time_until/1440:.1f} days"
-        
-        logger.info(
-            f"📅 Scheduled post {post_id} for {candidate_time.strftime('%A %b %d at %I:%M%p')} "
-            f"({time_str} from now) | Priority: {priority['emoji']} {priority['level']}"
-        )
-        
-        log_operation_success(
-            logger,
-            "assign_publish_slot",
-            post_id=post_id,
-            scheduled_for=candidate_time.isoformat()
-        )
-        
-        # Add jitter for natural appearance
-        if self.enable_jitter:
-            jitter = random.randint(-self.jitter_minutes, self.jitter_minutes)
-            candidate_time = candidate_time + timedelta(minutes=jitter)
-            logger.debug(f"   Applied jitter: {jitter:+d} minutes")
-        
-        # Create scheduled post entry with priority information
-        scheduled_post = ScheduledPost(
-            post_id=post_id,
-            variant_id=variant_id,
-            approved_at=datetime.now(),
-            scheduled_for=candidate_time,
-            status=ScheduledPostStatus.PENDING,
-            priority_level=priority['level'],
-            priority_score=priority['priority_score'],
-            post_age_hours=priority['age_hours']
-        )
-        
-        db.add(scheduled_post)
-        await db.commit()
-        await db.refresh(scheduled_post)
-        
-        # Log with priority context
-        time_until = (candidate_time - datetime.now()).total_seconds() / 60
+        time_until = (candidate_time - now_utc).total_seconds() / 60
         if time_until < 60:
             time_str = f"{time_until:.0f} minutes"
         elif time_until < 1440:
@@ -225,7 +197,7 @@ class PostScheduler:
         4. If day is at limit but has STALE posts, bump one STALE post to make room
         5. Otherwise find next available slot
         """
-        candidate_time = datetime.now()
+        candidate_time = datetime.now(timezone.utc)
         iteration = 0
         max_iterations = 365
         
@@ -446,7 +418,7 @@ class PostScheduler:
     async def _get_all_scheduled_posts(self, db: AsyncSession) -> List[ScheduledPost]:
         """Get all scheduled posts (pending or recently published)."""
         # Get pending posts + posts published in last 7 days (for spacing calculation)
-        cutoff = datetime.now() - timedelta(days=7)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
         
         result = await db.execute(
             select(ScheduledPost)
@@ -551,7 +523,7 @@ class PostScheduler:
             }
         
         # Calculate age in hours
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         age = now - original_post.original_post_date
         age_hours = age.total_seconds() / 3600
         
@@ -601,7 +573,7 @@ class PostScheduler:
         )
         pending = list(result.scalars().all())
         
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         today = now.date()
         week_from_now = now + timedelta(days=7)
         
