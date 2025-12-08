@@ -21,6 +21,7 @@ from app.linkedin import get_linkedin_service
 from app.linkedin_selenium import get_selenium_linkedin_service
 from app.scheduler import get_scheduler
 from app.admin_dashboard import get_dashboard_html
+from app.chrome_lock import get_chrome_lock
 from app.schemas import (
     LinkedInPostResponse,
     LinkedInPostDetailResponse,
@@ -47,6 +48,153 @@ setup_logging(log_level="INFO", log_file="/app/data/linkedin_reposter.log")
 logger = logging.getLogger(__name__)
 
 
+async def _publish_single_scheduled_post(
+    scheduled_post: ScheduledPost,
+    db: AsyncSession,
+    linkedin: any
+) -> tuple[bool, str]:
+    """
+    Shared function to publish a single scheduled post.
+    
+    This is the SINGLE SOURCE OF TRUTH for publishing logic.
+    Used by both:
+    - Scheduled publishing (check_and_publish_posts)
+    - Manual "Post Now" button (admin_post_now)
+    
+    Args:
+        scheduled_post: The ScheduledPost to publish
+        db: Database session
+        linkedin: Already initialized LinkedIn service
+        
+    Returns:
+        (success: bool, message: str)
+    """
+    from datetime import datetime
+    from app.health_monitor import update_last_successful_post, increment_failed_posts
+    
+    post_id = scheduled_post.post_id
+    variant_id = scheduled_post.variant_id
+    
+    logger.info(
+        f"📤 Publishing post {post_id} (scheduled for {scheduled_post.scheduled_for.strftime('%I:%M%p')})"
+    )
+    
+    try:
+        # Get the original post with all details
+        post_result = await db.execute(
+            select(LinkedInPost).where(LinkedInPost.id == post_id)
+        )
+        post = post_result.scalar_one_or_none()
+        
+        if not post:
+            raise ValueError(f"Post {post_id} not found")
+        
+        # Get variant
+        variant_result = await db.execute(
+            select(PostVariant).where(PostVariant.id == variant_id)
+        )
+        variant = variant_result.scalar_one_or_none()
+        
+        if not variant:
+            raise ValueError(f"Variant {variant_id} not found")
+        
+        if not variant.variant_content:
+            raise ValueError(f"Variant {variant_id} has no content")
+        
+        # Update post status to POSTING
+        post.status = PostStatus.POSTING
+        await db.commit()
+        
+        # Attempt to repost using direct URL approach
+        if not post.original_post_url:
+            raise ValueError(f"Post {post_id} has no original_post_url")
+            
+        success = await linkedin.repost_by_url(
+            post_url=post.original_post_url,
+            variant_text=variant.variant_content
+        )
+        
+        if success:
+            # Update scheduled post status
+            scheduled_post.status = ScheduledPostStatus.PUBLISHED
+            scheduled_post.published_at = datetime.now()
+            
+            # Update original post status
+            post.status = PostStatus.POSTED
+            post.posted_at = datetime.now()
+            post.error_message = None
+            
+            # Update variant status
+            variant.status = VariantStatus.POSTED
+            
+            # Update health monitoring
+            await update_last_successful_post(db)
+            
+            await db.commit()
+            
+            logger.info(f"✅ Published post {post_id} successfully")
+            return (True, f"Post published successfully to LinkedIn!")
+        else:
+            # Repost failed - original post not found
+            scheduled_post.retry_count += 1
+            scheduled_post.last_error = "Original post not found on LinkedIn"
+            
+            # Update post status to MISSING
+            post.status = PostStatus.MISSING
+            post.error_message = f"Could not find original post (attempt {scheduled_post.retry_count})"
+            post.retry_count = scheduled_post.retry_count
+            
+            # Lower priority for next attempt
+            post.priority = max(0, post.priority - 20)
+            
+            # Mark as failed if too many retries
+            max_retries = 5
+            if scheduled_post.retry_count >= max_retries:
+                scheduled_post.status = ScheduledPostStatus.FAILED
+                post.status = PostStatus.FAILED
+                post.error_message = f"Failed after {max_retries} attempts - original post not found"
+                
+                await increment_failed_posts(db)
+                
+                logger.error(
+                    f"❌ Post {post_id} failed after {max_retries} retries"
+                )
+            else:
+                # Reschedule for 30 minutes later
+                scheduled_post.scheduled_for = datetime.now() + timedelta(minutes=30)
+                logger.warning(
+                    f"⚠️  Post {post_id} not found (retry {scheduled_post.retry_count}/{max_retries}), "
+                    f"rescheduled for {scheduled_post.scheduled_for.strftime('%I:%M%p')}"
+                )
+            
+            await db.commit()
+            
+            return (False, "Original post not found on LinkedIn. It may have been deleted.")
+            
+    except Exception as e:
+        logger.error(f"❌ Error publishing post {post_id}: {e}")
+        
+        # Update retry count and error
+        scheduled_post.retry_count += 1
+        scheduled_post.last_error = str(e)
+        
+        # Update post status
+        post.status = PostStatus.FAILED if scheduled_post.retry_count >= 5 else PostStatus.MISSING
+        post.error_message = str(e)
+        post.retry_count = scheduled_post.retry_count
+        
+        max_retries = 5
+        if scheduled_post.retry_count >= max_retries:
+            scheduled_post.status = ScheduledPostStatus.FAILED
+            await increment_failed_posts(db)
+        else:
+            scheduled_post.scheduled_for = datetime.now() + timedelta(minutes=30)
+        
+        await db.commit()
+        
+        return (False, f"Error: {str(e)}")
+
+
 async def check_and_publish_posts():
     """
     Background task to check for posts that are due for publishing.
@@ -60,6 +208,10 @@ async def check_and_publish_posts():
     from sqlalchemy import and_
     
     log_operation_start(logger, "check_and_publish_posts")
+    
+    # Acquire Chrome lock for posting
+    chrome_lock = get_chrome_lock()
+    await chrome_lock.acquire(operation="posting", locked_by="check_and_publish_posts")
     
     try:
         # Get database session
@@ -95,7 +247,7 @@ async def check_and_publish_posts():
                 # Use Selenium service for reposting
                 settings = get_settings()
                 linkedin = get_selenium_linkedin_service(
-                    headless=False,  # Run with display for VNC debugging
+                    headless=False,  # Always non-headless so VNC shows security challenges
                     email=settings.linkedin_email,
                     password=settings.linkedin_password
                 )
@@ -107,116 +259,17 @@ async def check_and_publish_posts():
                     published_count = 0
                     failed_count = 0
                     
+                    # Publish each due post using shared function
                     for scheduled_post in due_posts:
-                        post_id = scheduled_post.post_id
-                        variant_id = scheduled_post.variant_id
-                        
-                        logger.info(
-                            f"📤 Publishing post {post_id} (scheduled for {scheduled_post.scheduled_for.strftime('%I:%M%p')})"
+                        success, message = await _publish_single_scheduled_post(
+                            scheduled_post=scheduled_post,
+                            db=db,
+                            linkedin=linkedin
                         )
                         
-                        try:
-                            # Get the original post with all details
-                            post_result = await db.execute(
-                                select(LinkedInPost).where(LinkedInPost.id == post_id)
-                            )
-                            post = post_result.scalar_one_or_none()
-                            
-                            if not post:
-                                raise ValueError(f"Post {post_id} not found")
-                            
-                            if not post.approved_variant_text:
-                                raise ValueError(f"Post {post_id} has no approved variant text")
-                            
-                            # Update post status to POSTING
-                            post.status = PostStatus.POSTING
-                            await db.commit()
-                            
-                            # Attempt to repost using our new repost flow
-                            success = await linkedin.repost_with_variant(
-                                author_handle=post.author_handle,
-                                original_content=post.original_content,
-                                variant_text=post.approved_variant_text,
-                                fuzzy_threshold=0.80
-                            )
-                            
-                            if success:
-                                # Update scheduled post status
-                                scheduled_post.status = ScheduledPostStatus.PUBLISHED
-                                scheduled_post.published_at = datetime.now()
-                                
-                                # Update original post status
-                                post.status = PostStatus.POSTED
-                                post.posted_at = datetime.now()
-                                post.error_message = None
-                                
-                                # Update health monitoring
-                                await update_last_successful_post(db)
-                                
-                                published_count += 1
-                                logger.info(f"✅ Published post {post_id} successfully")
-                            else:
-                                # Repost failed - original post not found
-                                scheduled_post.retry_count += 1
-                                scheduled_post.last_error = "Original post not found on LinkedIn"
-                                
-                                # Update post status to MISSING
-                                post.status = PostStatus.MISSING
-                                post.error_message = f"Could not find original post (attempt {scheduled_post.retry_count})"
-                                post.retry_count = scheduled_post.retry_count
-                                
-                                # Lower priority for next attempt
-                                post.priority = max(0, post.priority - 20)
-                                
-                                # Mark as failed if too many retries
-                                max_retries = 5
-                                if scheduled_post.retry_count >= max_retries:
-                                    scheduled_post.status = ScheduledPostStatus.FAILED
-                                    post.status = PostStatus.FAILED
-                                    post.error_message = f"Failed after {max_retries} attempts - original post not found"
-                                    
-                                    await increment_failed_posts(db)
-                                    
-                                    logger.error(
-                                        f"❌ Post {post_id} failed after {max_retries} retries"
-                                    )
-                                else:
-                                    # Reschedule for 30 minutes later
-                                    scheduled_post.scheduled_for = now + timedelta(minutes=30)
-                                    logger.warning(
-                                        f"⚠️  Post {post_id} not found (retry {scheduled_post.retry_count}/{max_retries}), "
-                                        f"rescheduled for {scheduled_post.scheduled_for.strftime('%I:%M%p')}"
-                                    )
-                                
-                                failed_count += 1
-                            
-                            await db.commit()
-                            
-                        except Exception as e:
-                            logger.error(f"❌ Error publishing post {post_id}: {e}")
-                            
-                            # Update retry count and error
-                            scheduled_post.retry_count += 1
-                            scheduled_post.last_error = str(e)
-                            
-                            # Update post status
-                            post_result = await db.execute(
-                                select(LinkedInPost).where(LinkedInPost.id == post_id)
-                            )
-                            post = post_result.scalar_one_or_none()
-                            if post:
-                                post.status = PostStatus.FAILED if scheduled_post.retry_count >= 5 else PostStatus.MISSING
-                                post.error_message = str(e)
-                                post.retry_count = scheduled_post.retry_count
-                            
-                            max_retries = 5
-                            if scheduled_post.retry_count >= max_retries:
-                                scheduled_post.status = ScheduledPostStatus.FAILED
-                                await increment_failed_posts(db)
-                            else:
-                                scheduled_post.scheduled_for = now + timedelta(minutes=30)
-                            
-                            await db.commit()
+                        if success:
+                            published_count += 1
+                        else:
                             failed_count += 1
                     
                     logger.info(
@@ -238,6 +291,9 @@ async def check_and_publish_posts():
                 
     except Exception as e:
         log_operation_error(logger, "check_and_publish_posts", e)
+    finally:
+        # Always release the Chrome lock
+        chrome_lock.release()
 
 
 async def scheduled_scrape_and_process():
@@ -263,13 +319,17 @@ async def scheduled_scrape_and_process():
     total_processed = 0
     total_failed = 0
     
+    # Acquire Chrome lock for scraping
+    chrome_lock = get_chrome_lock()
+    await chrome_lock.acquire(operation="scraping", locked_by="scheduled_scrape_and_process")
+    
     try:
         # Get database session
         async for db in get_db():
             try:
                 # Get services
                 linkedin = get_selenium_linkedin_service(
-                    headless=False,
+                    headless=False,  # Always non-headless so VNC shows security challenges
                     email=settings.linkedin_email,
                     password=settings.linkedin_password
                 )
@@ -283,6 +343,10 @@ async def scheduled_scrape_and_process():
                     # Scrape each handle
                     for idx, handle in enumerate(handles):
                         handle = handle.strip()
+                        
+                        # Update progress
+                        chrome_lock.update_progress(f"Scraping @{handle} ({idx + 1}/{len(handles)})")
+                        
                         logger.info(f"📥 Scraping @{handle}...")
                         
                         try:
@@ -432,6 +496,123 @@ async def scheduled_scrape_and_process():
                 
     except Exception as e:
         log_operation_error(logger, "scheduled_scrape_and_process", e)
+    finally:
+        # Always release the Chrome lock
+        chrome_lock.release()
+
+
+
+async def cleanup_stale_schedule():
+    """
+    Daily cleanup task to remove DEAD posts from the schedule.
+    
+    Runs at 3 AM MST to clean up posts that are too old to be relevant.
+    
+    Rules:
+    - DEAD (>7 days): Automatically removed
+    - STALE (2-7 days): Kept but logged as low value
+    - URGENT posts: Never auto-removed regardless of age
+    """
+    log_operation_start(logger, "cleanup_stale_schedule")
+    
+    try:
+        settings = get_settings()
+        dead_threshold_days = settings.dead_post_threshold_days
+        stale_threshold_days = settings.stale_post_threshold_days
+        
+        async for db in get_db():
+            try:
+                from datetime import datetime, timedelta
+                
+                # Get all pending scheduled posts
+                result = await db.execute(
+                    select(ScheduledPost)
+                    .where(ScheduledPost.status == ScheduledPostStatus.PENDING)
+                    .options(selectinload(ScheduledPost.post))
+                )
+                scheduled_posts = result.scalars().all()
+                
+                now = datetime.now()
+                dead_cutoff = now - timedelta(days=dead_threshold_days)
+                stale_cutoff = now - timedelta(days=stale_threshold_days)
+                
+                dead_count = 0
+                stale_count = 0
+                removed_posts = []
+                
+                for sched_post in scheduled_posts:
+                    if not sched_post.post or not sched_post.post.original_post_date:
+                        continue
+                    
+                    post_age = now - sched_post.post.original_post_date
+                    age_days = post_age.total_seconds() / 86400
+                    
+                    # Never remove URGENT posts automatically
+                    if sched_post.priority_level == 'URGENT':
+                        logger.debug(
+                            f"⏩ Skipping URGENT post {sched_post.id} (age: {age_days:.1f}d) - "
+                            f"protected from auto-cleanup"
+                        )
+                        continue
+                    
+                    # Remove DEAD posts (>7 days)
+                    if sched_post.post.original_post_date < dead_cutoff:
+                        dead_count += 1
+                        removed_posts.append({
+                            'id': sched_post.id,
+                            'age_days': age_days,
+                            'author': sched_post.post.author_name,
+                            'priority': sched_post.priority_level or 'UNKNOWN',
+                            'reason': 'DEAD'
+                        })
+                        
+                        logger.info(
+                            f"💀 Removing DEAD post {sched_post.id}: "
+                            f"{sched_post.post.author_name} (age: {age_days:.1f}d, "
+                            f"priority: {sched_post.priority_level})"
+                        )
+                        
+                        # Cancel the scheduled post
+                        await db.delete(sched_post)
+                    
+                    # Log STALE posts but keep them
+                    elif sched_post.post.original_post_date < stale_cutoff:
+                        stale_count += 1
+                        logger.debug(
+                            f"⚠️  STALE post {sched_post.id}: "
+                            f"{sched_post.post.author_name} (age: {age_days:.1f}d, "
+                            f"priority: {sched_post.priority_level})"
+                        )
+                
+                await db.commit()
+                
+                logger.info(
+                    f"🧹 Cleanup complete: removed {dead_count} DEAD posts, "
+                    f"{stale_count} STALE posts remain"
+                )
+                
+                log_operation_success(
+                    logger,
+                    "cleanup_stale_schedule",
+                    dead_removed=dead_count,
+                    stale_count=stale_count,
+                    total_checked=len(scheduled_posts)
+                )
+                
+                return {
+                    'removed': removed_posts,
+                    'dead_count': dead_count,
+                    'stale_count': stale_count,
+                    'total_checked': len(scheduled_posts)
+                }
+                
+            finally:
+                await db.close()
+                break
+    
+    except Exception as e:
+        log_operation_error(logger, "cleanup_stale_schedule", e)
+        raise
 
 
 @asynccontextmanager
@@ -492,10 +673,20 @@ async def lifespan(app: FastAPI):
         replace_existing=True
     )
     
+    # Clean up stale posts daily at 3 AM MST
+    scheduler_instance.add_job(
+        func=lambda: asyncio.create_task(cleanup_stale_schedule()),
+        trigger=CronTrigger(hour='3', minute='0', timezone='America/Denver'),
+        id='cleanup_stale_schedule',
+        name='Clean up DEAD posts from schedule',
+        replace_existing=True
+    )
+    
     scheduler_instance.start()
     logger.info("✅ Background scheduler started")
     logger.info("   📅 Publishing check: Every 5 minutes")
     logger.info("   📅 Scraping schedule: 5:30 AM and 1:00 PM MST/MDT")
+    logger.info("   📅 Cleanup schedule: 3:00 AM MST/MDT (removes DEAD posts >7 days)")
     
     yield
     
@@ -895,6 +1086,23 @@ async def admin_regenerate_variants(
         raise HTTPException(status_code=500, detail=f"Failed to generate variants: {str(e)}")
 
 
+@app.get("/admin/status")
+async def admin_status():
+    """
+    Get current Chrome operation status for admin dashboard.
+    
+    Returns:
+        - is_locked: Whether Chrome is currently in use
+        - operation: Type of operation (scraping, posting, etc.)
+        - started_at: When operation started
+        - elapsed_seconds: How long operation has been running
+        - current_progress: Human-readable progress (e.g., "Processing @handle 3/10")
+        - waiters: Number of operations waiting for Chrome lock
+    """
+    chrome_lock = get_chrome_lock()
+    return JSONResponse(content=chrome_lock.get_status_dict())
+
+
 @app.post("/admin/posts/{post_id}/reject")
 async def admin_reject_post(
     post_id: int,
@@ -994,6 +1202,150 @@ async def admin_delete_scheduled_post(
     return {"success": True, "message": "Removed from schedule"}
 
 
+@app.post("/admin/scheduled/{scheduled_post_id}/post-now")
+async def admin_post_now(
+    scheduled_post_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Manually post a scheduled item immediately to LinkedIn."""
+    log_operation_start(logger, "admin_post_now", scheduled_post_id=scheduled_post_id)
+    
+    # Acquire Chrome lock for posting (will wait if scraping is in progress)
+    chrome_lock = get_chrome_lock()
+    await chrome_lock.acquire(operation="posting", locked_by=f"admin_post_now({scheduled_post_id})")
+    
+    try:
+        # Get the scheduled post with related data
+        result = await db.execute(
+            select(ScheduledPost)
+            .where(ScheduledPost.id == scheduled_post_id)
+            .options(
+                selectinload(ScheduledPost.post),
+                selectinload(ScheduledPost.variant)
+            )
+        )
+        scheduled_post = result.scalar_one_or_none()
+        
+        if not scheduled_post:
+            raise HTTPException(status_code=404, detail="Scheduled post not found")
+        
+        if scheduled_post.status != ScheduledPostStatus.PENDING:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Cannot post - status is {scheduled_post.status.value}"
+            )
+        
+        # Initialize LinkedIn service
+        settings = get_settings()
+        linkedin = get_selenium_linkedin_service(
+            headless=False,  # Always non-headless so VNC shows security challenges
+            email=settings.linkedin_email,
+            password=settings.linkedin_password
+        )
+        
+        try:
+            logger.info(f"📤 Manual post: Publishing post {scheduled_post.post_id} immediately")
+            
+            # Use shared publishing function (SINGLE SOURCE OF TRUTH)
+            success, message = await _publish_single_scheduled_post(
+                scheduled_post=scheduled_post,
+                db=db,
+                linkedin=linkedin
+            )
+            
+            if success:
+                log_operation_success(logger, "admin_post_now", scheduled_post_id=scheduled_post_id)
+                return {
+                    "success": True,
+                    "message": message
+                }
+            else:
+                # Failed - raise HTTP exception
+                raise HTTPException(
+                    status_code=404,
+                    detail=message
+                )
+                
+        finally:
+            await linkedin.stop()
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_operation_error(logger, "admin_post_now", e)
+        raise HTTPException(status_code=500, detail=f"Failed to post: {str(e)}")
+    finally:
+        # Always release the Chrome lock
+        chrome_lock.release()
+
+
+
+async def _keep_browser_open(url: str):
+    """Background task to keep browser open for manual inspection."""
+    logger.info(f"🚀 Background task started for URL: {url}")
+    
+    from app.linkedin_selenium import LinkedInSeleniumAutomation
+    import time
+    
+    linkedin = LinkedInSeleniumAutomation(headless=False)  # Non-headless for VNC visibility
+    
+    try:
+        # Start browser
+        logger.info("⏳ Starting browser...")
+        await linkedin.start()
+        logger.info("✅ Browser started")
+        
+        # Navigate to URL
+        logger.info(f"🌐 Navigating to: {url}")
+        linkedin.driver.get(url)
+        
+        logger.info(f"✅ Browser opened to: {url}")
+        logger.info("🔍 Browser will stay open - close the window when done")
+        logger.info("📺 View at: http://localhost:8080/admin/vnc")
+        
+        # Keep browser open for 10 minutes or until closed
+        for i in range(600):  # 10 minutes
+            try:
+                # Check if browser is still alive
+                linkedin.driver.title
+                time.sleep(1)
+            except Exception as e:
+                logger.info(f"🛑 Browser check failed: {e}")
+                break
+                
+    except Exception as e:
+        logger.error(f"❌ Error in browser session: {e}", exc_info=True)
+    finally:
+        try:
+            logger.info("🧹 Cleaning up browser...")
+            await linkedin.stop()
+            logger.info("✅ Browser cleanup complete")
+        except Exception as e:
+            logger.error(f"❌ Error stopping browser: {e}")
+
+
+@app.post("/admin/open-browser")
+async def admin_open_browser(url: str = "https://www.linkedin.com/feed/"):
+    """
+    Open browser and navigate to a URL for manual inspection via VNC.
+    Browser stays open until user closes the window.
+    
+    Query params:
+    - url: URL to navigate to (default: LinkedIn feed)
+    """
+    log_operation_start(logger, "admin_open_browser", url=url)
+    
+    # Run browser in background task
+    asyncio.create_task(_keep_browser_open(url))
+    
+    # Return immediately
+    return {
+        "success": True,
+        "message": f"Browser opening to {url}. Close the browser window when done.",
+        "vnc_url": "http://localhost:8080/admin/vnc"
+    }
+
+
 @app.post("/admin/trigger-scrape")
 async def admin_trigger_scrape(db: AsyncSession = Depends(get_db)):
     """Manually trigger a scrape of all monitored LinkedIn handles."""
@@ -1008,6 +1360,99 @@ async def admin_trigger_scrape(db: AsyncSession = Depends(get_db)):
         "success": True,
         "message": "Scraping started in background"
     }
+
+
+@app.post("/admin/cleanup-schedule")
+async def admin_cleanup_schedule(
+    preview: bool = True,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Clean up DEAD posts from the schedule.
+    
+    Query params:
+    - preview: If true (default), shows what would be removed without actually removing
+    """
+    log_operation_start(logger, "admin_cleanup_schedule", preview=preview)
+    
+    try:
+        settings = get_settings()
+        dead_threshold_days = settings.dead_post_threshold_days
+        stale_threshold_days = settings.stale_post_threshold_days
+        
+        # Get all pending scheduled posts
+        result = await db.execute(
+            select(ScheduledPost)
+            .where(ScheduledPost.status == ScheduledPostStatus.PENDING)
+            .options(selectinload(ScheduledPost.post))
+        )
+        scheduled_posts = result.scalars().all()
+        
+        now = datetime.now()
+        dead_cutoff = now - timedelta(days=dead_threshold_days)
+        stale_cutoff = now - timedelta(days=stale_threshold_days)
+        
+        dead_posts = []
+        stale_posts = []
+        protected_posts = []
+        
+        for sched_post in scheduled_posts:
+            if not sched_post.post or not sched_post.post.original_post_date:
+                continue
+            
+            post_age = now - sched_post.post.original_post_date
+            age_days = post_age.total_seconds() / 86400
+            
+            post_info = {
+                'id': sched_post.id,
+                'age_days': round(age_days, 1),
+                'author': sched_post.post.author_name,
+                'priority': sched_post.priority_level or 'UNKNOWN',
+                'scheduled_for': sched_post.scheduled_for.strftime('%Y-%m-%d %H:%M')
+            }
+            
+            # URGENT posts are protected
+            if sched_post.priority_level == 'URGENT':
+                protected_posts.append(post_info)
+                continue
+            
+            # DEAD posts (>7 days)
+            if sched_post.post.original_post_date < dead_cutoff:
+                dead_posts.append(post_info)
+                if not preview:
+                    await db.delete(sched_post)
+            
+            # STALE posts (2-7 days)
+            elif sched_post.post.original_post_date < stale_cutoff:
+                stale_posts.append(post_info)
+        
+        if not preview:
+            await db.commit()
+        
+        log_operation_success(
+            logger,
+            "admin_cleanup_schedule",
+            preview=preview,
+            dead_count=len(dead_posts),
+            stale_count=len(stale_posts)
+        )
+        
+        return {
+            "success": True,
+            "preview": preview,
+            "message": f"{'Would remove' if preview else 'Removed'} {len(dead_posts)} DEAD posts",
+            "dead_posts": dead_posts,
+            "stale_posts": stale_posts,
+            "protected_posts": protected_posts,
+            "thresholds": {
+                "dead_days": dead_threshold_days,
+                "stale_days": stale_threshold_days
+            }
+        }
+    
+    except Exception as e:
+        log_operation_error(logger, "admin_cleanup_schedule", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 async def scrub_schedule_internal(db: AsyncSession):
@@ -2420,7 +2865,7 @@ async def linkedin_repost(
     # Use Selenium service for reposting
     settings = get_settings()
     linkedin = get_selenium_linkedin_service(
-        headless=False,  # Run with display for VNC debugging
+        headless=False,  # Always non-headless so VNC shows security challenges
         email=settings.linkedin_email,
         password=settings.linkedin_password
     )

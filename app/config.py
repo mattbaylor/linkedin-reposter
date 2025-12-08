@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     # Rate limiting safety
     max_posts_per_hour: int = 5
     
+    # Schedule cleanup configuration
+    dead_post_threshold_days: int = 7  # Posts older than 7 days are DEAD and auto-removed
+    stale_post_threshold_days: int = 2  # Posts older than 2 days are STALE (low priority)
+    auto_cleanup_dead_posts: bool = True  # Auto-remove DEAD posts during daily cleanup
+    cleanup_schedule_hour: int = 3  # Run cleanup at 3 AM MST
+    
     class Config:
         env_file = ".env"
         case_sensitive = False

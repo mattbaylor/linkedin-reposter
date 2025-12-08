@@ -163,49 +163,6 @@ class PostScheduler:
             scheduled_for=candidate_time.isoformat()
         )
         
-        # Add jitter for natural appearance
-        if self.enable_jitter:
-            jitter = random.randint(-self.jitter_minutes, self.jitter_minutes)
-            candidate_time = candidate_time + timedelta(minutes=jitter)
-            logger.debug(f"   Applied jitter: {jitter:+d} minutes")
-        
-        # Create scheduled post entry with priority information
-        scheduled_post = ScheduledPost(
-            post_id=post_id,
-            variant_id=variant_id,
-            approved_at=datetime.now(),
-            scheduled_for=candidate_time,
-            status=ScheduledPostStatus.PENDING,
-            priority_level=priority['level'],
-            priority_score=priority['priority_score'],
-            post_age_hours=priority['age_hours']
-        )
-        
-        db.add(scheduled_post)
-        await db.commit()
-        await db.refresh(scheduled_post)
-        
-        # Log with priority context
-        time_until = (candidate_time - datetime.now()).total_seconds() / 60
-        if time_until < 60:
-            time_str = f"{time_until:.0f} minutes"
-        elif time_until < 1440:
-            time_str = f"{time_until/60:.1f} hours"
-        else:
-            time_str = f"{time_until/1440:.1f} days"
-        
-        logger.info(
-            f"📅 Scheduled post {post_id} for {candidate_time.strftime('%A %b %d at %I:%M%p')} "
-            f"({time_str} from now) | Priority: {priority['emoji']} {priority['level']}"
-        )
-        
-        log_operation_success(
-            logger,
-            "assign_publish_slot",
-            post_id=post_id,
-            scheduled_for=candidate_time.isoformat()
-        )
-        
         return candidate_time
     
     async def _find_urgent_slot(

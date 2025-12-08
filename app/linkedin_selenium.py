@@ -66,9 +66,28 @@ class LinkedInPost:
 
 class LinkedInSeleniumAutomation:
     """
-    LinkedIn automation using Selenium with undetected-chromedriver.
+    LinkedIn automation using Selenium with stealth techniques.
     
-    This bypasses LinkedIn's bot detection better than Playwright.
+    CRITICAL DESIGN DECISIONS - READ BEFORE MODIFYING:
+    ===================================================
+    
+    1. NO PERSISTENT USER-DATA-DIR:
+       - We do NOT use --user-data-dir for Chrome
+       - Persistent user-data-dir causes Chrome crashes in Docker due to lock files
+       - This issue was encountered and debugged multiple times (Dec 2024)
+       - Solution: Let Chrome use temp directories, authenticate via saved cookies instead
+       - If you're tempted to add --user-data-dir back: DON'T. It will break.
+       
+    2. COOKIE-BASED AUTHENTICATION:
+       - Session state is preserved via cookies saved to /app/data/linkedin_session/cookies.json
+       - Cookies are loaded on each browser start
+       - This approach is more reliable than persistent profiles in Docker
+       
+    3. ALWAYS NON-HEADLESS (headless=False):
+       - All tasks run with headless=False so browser is visible in VNC
+       - This allows manual intervention for security challenges (CAPTCHA, verification)
+       - Accept the performance overhead to maintain visibility
+       - Dec 2024: Complexity of switching modes not worth it
     """
     
     def __init__(self, headless: bool = True, email: str = None, password: str = None):
@@ -150,37 +169,32 @@ class LinkedInSeleniumAutomation:
         return health
     
     def _start_driver(self):
-        """Start the Chrome driver with stealth (sync)."""
+        """Start the Chrome driver with stealth (sync).
+        
+        CRITICAL: DO NOT add --user-data-dir argument!
+        ================================================
+        We previously tried using persistent user-data-dir but it causes Chrome to crash
+        in Docker containers due to singleton lock files that don't clean up properly.
+        
+        This was debugged multiple times (Dec 2024) and the solution is:
+        - Let Chrome use its default temp directories (no --user-data-dir)
+        - Authenticate via cookies saved to cookies.json (loaded after browser starts)
+        - Accept that each browser session starts "fresh" but cookies restore state
+        
+        If you're tempted to add --user-data-dir back: DON'T. It will break again.
+        """
         try:
             options = Options()
             
             if self.headless:
                 options.add_argument('--headless=new')
+                # Fix for DevToolsActivePort file doesn't exist error
+                options.add_argument('--remote-debugging-port=0')
             
-            # Set user data directory to avoid temp dir creation issues
-            browser_data_dir = "/app/data/browser_data"
-            os.makedirs(browser_data_dir, exist_ok=True)
+            # DON'T use --user-data-dir! Let Chrome use temp directories.
+            # We authenticate via cookies which are saved separately.
+            logger.debug(f"🔧 Using Chrome default temp directories (no persistent user-data-dir)")
             
-            # Clean up stale lock files that can prevent Chrome from starting
-            lock_files = [
-                f"{browser_data_dir}/SingletonLock",
-                f"{browser_data_dir}/SingletonSocket",
-                f"{browser_data_dir}/SingletonCookie"
-            ]
-            for lock_file in lock_files:
-                try:
-                    if os.path.exists(lock_file):
-                        os.remove(lock_file)
-                        logger.debug(f"🧹 Removed stale lock file: {lock_file}")
-                except Exception as e:
-                    logger.debug(f"⚠️  Could not remove {lock_file}: {e}")
-            
-            # Set additional directories to avoid permission issues
-            options.add_argument(f'--user-data-dir={browser_data_dir}')
-            
-            # Set additional directories to avoid permission issues
-            options.add_argument(f'--disk-cache-dir={browser_data_dir}/cache')
-            options.add_argument(f'--data-path={browser_data_dir}/data')
             options.add_argument('--disable-extensions')
             
             # Essential Docker/Container arguments
@@ -932,30 +946,59 @@ Alternative: Connect via VNC client to localhost:5900
                         logger.debug(f"⚠️  Skipping post {idx+1} - no substantial content")
                         continue
                     
-                    # EXTRACT UNIQUE POST URL - Look for activity URN
+                    # EXTRACT UNIQUE POST URL - Use "Copy link to post" feature
                     post_url = None
                     
-                    # Try to find link with activity ID
-                    link = post_element.find('a', href=lambda h: h and ('/posts/' in h or '/activity/' in h or 'urn:li:activity' in h))
-                    if link:
-                        href = link.get('href', '')
-                        if href:
-                            # Extract activity ID if present
-                            if 'urn:li:activity:' in href or '/activity-' in href or '/posts/' in href:
-                                post_url = href if href.startswith('http') else f"https://www.linkedin.com{href}"
+                    # Strategy: Find the post element in the actual DOM (not BeautifulSoup) and click "Copy link"
+                    # We need to use Selenium to interact with the live page
+                    try:
+                        # Find all posts in the live DOM by the same "Feed post number" header
+                        # CRITICAL: Must find the article container (3 levels up from h2), not immediate parent
+                        from selenium.webdriver.common.by import By
+                        
+                        # DEBUG: Log current URL and try different selectors
+                        logger.info(f"   🔍 DEBUG: Current URL = {self.driver.current_url}")
+                        
+                        # Try multiple strategies
+                        h2_elements = self.driver.find_elements(By.XPATH, "//h2[contains(@class, 'visually-hidden')]")
+                        logger.info(f"   🔍 DEBUG: Found {len(h2_elements)} h2 elements with visually-hidden class")
+                        
+                        h2_with_text = self.driver.find_elements(By.XPATH, "//h2[contains(., 'Feed post number')]")
+                        logger.info(f"   🔍 DEBUG: Found {len(h2_with_text)} h2 elements containing 'Feed post number'")
+                        
+                        articles = self.driver.find_elements(By.XPATH, "//div[@role='article']")
+                        logger.info(f"   🔍 DEBUG: Found {len(articles)} div elements with role='article'")
+                        
+                        live_posts = self.driver.find_elements(By.XPATH, "//h2[contains(@class, 'visually-hidden') and contains(., 'Feed post number')]/ancestor::div[@role='article']")
+                        
+                        logger.info(f"   🔍 Found {len(live_posts)} live posts in DOM for post {idx+1}")
+                        
+                        if idx < len(live_posts):
+                            live_post = live_posts[idx]
+                            
+                            # Extract the data-urn attribute from the article element
+                            # This contains the LinkedIn activity ID we need for the URL
+                            try:
+                                data_urn = live_post.get_attribute("data-urn")
+                                if data_urn and 'activity:' in data_urn:
+                                    # Format: urn:li:activity:7402441752508465152
+                                    # Convert to: https://www.linkedin.com/feed/update/urn:li:activity:7402441752508465152/
+                                    post_url = f"https://www.linkedin.com/feed/update/{data_urn}/"
+                                    logger.info(f"   ✅ Extracted URL from data-urn: {post_url}")
+                                else:
+                                    logger.warning(f"   ⚠️  No valid data-urn found on post {idx+1}: {data_urn}")
+                            except Exception as urn_err:
+                                logger.warning(f"   ⚠️  Could not extract data-urn: {urn_err}")
+                        else:
+                            logger.warning(f"   ⚠️  Post index {idx} out of range (only {len(live_posts)} posts)")
+                    except Exception as e:
+                        logger.warning(f"   ⚠️  Error extracting URL via copy link: {e}", exc_info=True)
                     
-                    # Fallback: Try to extract from data attributes
-                    if not post_url:
-                        # Look for data-urn or similar attributes
-                        urn = post_element.get('data-urn') or post_element.get('data-id')
-                        if urn and 'activity' in str(urn):
-                            post_url = f"https://www.linkedin.com/feed/update/{urn}/"
-                    
-                    # Last resort: use profile URL + timestamp
+                    # Fallback: use profile URL + timestamp if copy link failed
                     if not post_url:
                         timestamp = int(datetime.utcnow().timestamp())
                         post_url = f"{profile_url}#post-{timestamp}-{idx}"
-                        logger.warning(f"⚠️  Could not find unique activity ID for post {idx+1}, using fallback URL")
+                        logger.warning(f"⚠️  Could not extract URL via copy link for post {idx+1}, using fallback URL")
                     
                     # EXTRACT POST DATE - Look for relative time text
                     logger.info(f"   🕐 Starting date extraction for post {idx+1}")
@@ -1208,6 +1251,188 @@ Alternative: Connect via VNC client to localhost:5900
             
         except Exception as e:
             logger.warning(f"⚠️  Failed to like post {post_url}: {e}")
+            return False
+    
+    def _repost_by_url(self, post_url: str, variant_text: str) -> bool:
+        """
+        Repost a LinkedIn post using its direct URL.
+        
+        SIMPLER APPROACH:
+        1. Navigate directly to post URL
+        2. Find repost button on that page
+        3. Click repost
+        4. Add variant commentary
+        5. Submit
+        
+        Args:
+            post_url: Direct URL to the LinkedIn post (e.g., https://www.linkedin.com/feed/update/urn:...)
+            variant_text: AI-generated variant text to add as commentary
+            
+        Returns:
+            True if successfully reposted, False otherwise
+        """
+        log_operation_start(logger, "repost_by_url", url=post_url[:80])
+        
+        try:
+            # Step 1: Navigate to the post URL
+            logger.info(f"📍 Navigating to post: {post_url}")
+            self.driver.get(post_url)
+            time.sleep(3)  # Wait for page load
+            
+            # Step 2: Find the repost button
+            logger.info("🔘 Looking for repost button...")
+            repost_button = None
+            
+            # Try multiple selectors for the repost button
+            repost_selectors = [
+                'button[aria-label*="Repost"]',
+                'button[aria-label*="repost"]',
+                'button.share-actions__primary-action',
+                '//button[contains(@aria-label, "Repost")]',
+                '//button[.//span[contains(text(), "Repost")]]',
+            ]
+            
+            for selector in repost_selectors:
+                try:
+                    if selector.startswith('//'):
+                        repost_button = self.driver.find_element(By.XPATH, selector)
+                    else:
+                        repost_button = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    
+                    if repost_button:
+                        logger.info(f"✅ Found repost button with selector: {selector}")
+                        break
+                except NoSuchElementException:
+                    continue
+            
+            if not repost_button:
+                logger.error("❌ Could not find repost button on post page")
+                return False
+            
+            # Step 3: Click the repost button
+            logger.info("🖱️  Clicking repost button...")
+            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", repost_button)
+            time.sleep(0.5)
+            self.driver.execute_script("arguments[0].click();", repost_button)
+            time.sleep(4)  # Wait longer for modal/menu to open
+            
+            # Step 4: Look for "Repost with your thoughts" option in the dropdown
+            logger.info("💭 Looking for 'Repost with your thoughts' option...")
+            
+            # Find the text "Repost with your thoughts" first, then navigate to clickable parent
+            thoughts_selectors = [
+                # Find span with exact text, go up 2 levels to the clickable div
+                '//span[contains(text(), "Repost with your thoughts")]/ancestor::div[@role="button"]',
+                '//span[contains(text(), "Repost with your thoughts")]/ancestor::div[@class="artdeco-dropdown__item"]',
+                '//span[contains(text(), "Repost with your thoughts")]/../..',
+                '//span[contains(text(), "Repost with your thoughts")]/..',
+                # Case insensitive
+                '//span[contains(translate(text(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "repost with your thoughts")]/ancestor::div[@role="button"]',
+                # Try the container divs directly
+                '//div[contains(@class, "artdeco-dropdown__item") and contains(., "Repost with your thoughts")]',
+                '//div[@role="button" and contains(., "Repost with your thoughts")]',
+            ]
+            
+            thoughts_button = None
+            for selector in thoughts_selectors:
+                try:
+                    thoughts_button = self.driver.find_element(By.XPATH, selector)
+                    if thoughts_button:
+                        logger.info(f"✅ Found 'thoughts' button with selector: {selector}")
+                        break
+                except NoSuchElementException:
+                    continue
+            
+            if not thoughts_button:
+                # Debug: log what's actually in the dropdown
+                try:
+                    page_text = self.driver.find_element(By.TAG_NAME, "body").text
+                    logger.warning(f"⚠️  Page contains: {page_text[:500]}")
+                except:
+                    pass
+                logger.error("❌ Could not find 'Repost with your thoughts' button")
+                return False
+            
+            # Click "Repost with your thoughts"
+            logger.info("🖱️  Clicking 'Repost with your thoughts'...")
+            thoughts_button.click()
+            time.sleep(2)  # Wait for editor to open
+            
+            # Step 5: Find the text editor and add variant content
+            logger.info("✍️  Looking for text editor...")
+            
+            editor_selectors = [
+                'div[role="textbox"]',
+                'div.ql-editor',
+                'div[contenteditable="true"]',
+                '//div[@role="textbox"]',
+            ]
+            
+            editor = None
+            for selector in editor_selectors:
+                try:
+                    if selector.startswith('//'):
+                        editor = self.driver.find_element(By.XPATH, selector)
+                    else:
+                        editor = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    
+                    if editor:
+                        logger.info(f"✅ Found editor with selector: {selector}")
+                        break
+                except NoSuchElementException:
+                    continue
+            
+            if not editor:
+                logger.error("❌ Could not find text editor")
+                return False
+            
+            # Click editor and add variant text
+            logger.info(f"📝 Adding variant content ({len(variant_text)} chars)...")
+            editor.click()
+            time.sleep(0.5)
+            editor.send_keys(variant_text)
+            time.sleep(1)
+            
+            # Step 6: Find and click the Post button
+            logger.info("🔍 Looking for Post button...")
+            
+            post_selectors = [
+                'button[aria-label="Post"]',
+                '//button[contains(@aria-label, "Post")]',
+                '//button[.//span[text()="Post"]]',
+                'button.share-actions__primary-action',
+            ]
+            
+            post_button = None
+            for selector in post_selectors:
+                try:
+                    if selector.startswith('//'):
+                        post_button = self.driver.find_element(By.XPATH, selector)
+                    else:
+                        post_button = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    
+                    if post_button and post_button.is_enabled():
+                        logger.info(f"✅ Found Post button with selector: {selector}")
+                        break
+                except NoSuchElementException:
+                    continue
+            
+            if not post_button:
+                logger.error("❌ Could not find enabled Post button")
+                return False
+            
+            # Final step: Click Post!
+            logger.info("📤 Clicking Post button...")
+            post_button.click()
+            time.sleep(3)  # Wait for post to submit
+            
+            logger.info("✅ Successfully reposted with variant content!")
+            log_operation_success(logger, "repost_by_url", url=post_url[:80])
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error reposting by URL: {e}")
+            log_operation_error(logger, "repost_by_url", e)
             return False
     
     def _find_post_by_content(
@@ -1523,6 +1748,53 @@ Alternative: Connect via VNC client to localhost:5900
             
         except Exception as e:
             logger.error(f"❌ Error in repost flow: {e}")
+            return False
+    
+    async def repost_by_url(
+        self,
+        post_url: str,
+        variant_text: str
+    ) -> bool:
+        """
+        Repost a LinkedIn post using its direct URL (async wrapper).
+        
+        SIMPLER APPROACH - Use this instead of repost_with_variant when you have the URL:
+        1. Navigate directly to the post URL
+        2. Click repost button
+        3. Add variant commentary
+        4. Submit
+        
+        Args:
+            post_url: Direct URL to the LinkedIn post
+            variant_text: AI-generated variant text to add as commentary
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        log_operation_start(logger, "selenium_repost_by_url", url=post_url[:80])
+        
+        try:
+            # Start driver if not already started
+            await self.start()
+            
+            # Run repost in thread pool
+            loop = asyncio.get_event_loop()
+            success = await loop.run_in_executor(
+                self.executor,
+                self._repost_by_url,
+                post_url,
+                variant_text
+            )
+            
+            if success:
+                log_operation_success(logger, "selenium_repost_by_url", url=post_url[:80])
+            else:
+                logger.warning(f"⚠️  Repost by URL failed for: {post_url}")
+            
+            return success
+            
+        except Exception as e:
+            log_operation_error(logger, "selenium_repost_by_url", e)
             return False
     
     async def repost_with_variant(

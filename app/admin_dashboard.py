@@ -30,6 +30,9 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                 <td><span class="badge" style="background-color: {priority_color}">{sched.get('priority_level', 'NORMAL')}</span></td>
                 <td>{sched['approved_at']}</td>
                 <td>
+                    <button onclick="postNow({sched['id']})" class="btn btn-success btn-sm" title="Post immediately" style="margin-right: 5px;">
+                        📤 Post Now
+                    </button>
                     <button onclick="deleteScheduledPost({sched['id']})" class="btn btn-danger btn-sm" title="Remove from schedule">
                         🗑️
                     </button>
@@ -404,6 +407,70 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                 padding: 12px;
                 vertical-align: top;
             }}
+            
+            #status-banner {{
+                display: none;
+                background: #fff3cd;
+                border: 1px solid #ffecb5;
+                border-radius: 8px;
+                padding: 15px 20px;
+                margin-bottom: 20px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }}
+            
+            #status-banner.active {{
+                display: block;
+            }}
+            
+            #status-banner.scraping {{
+                background: #cfe2ff;
+                border-color: #9ec5fe;
+            }}
+            
+            #status-banner.posting {{
+                background: #d1e7dd;
+                border-color: #a3cfbb;
+            }}
+            
+            #status-banner.locked {{
+                background: #f8d7da;
+                border-color: #f1aeb5;
+            }}
+            
+            .status-content {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+            }}
+            
+            .status-info {{
+                flex: 1;
+            }}
+            
+            .status-title {{
+                font-weight: bold;
+                font-size: 16px;
+                margin-bottom: 5px;
+            }}
+            
+            .status-details {{
+                font-size: 14px;
+                color: #666;
+            }}
+            
+            .status-spinner {{
+                display: inline-block;
+                width: 16px;
+                height: 16px;
+                border: 2px solid #ccc;
+                border-top-color: #0a66c2;
+                border-radius: 50%;
+                animation: spin 1s linear infinite;
+            }}
+            
+            @keyframes spin {{
+                to {{ transform: rotate(360deg); }}
+            }}
         </style>
     </head>
     <body>
@@ -417,6 +484,24 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                     <a href="/docs">📚 API Docs</a>
                 </div>
             </header>
+            
+            <!-- Status Banner -->
+            <div id="status-banner">
+                <div class="status-content">
+                    <div class="status-info">
+                        <div class="status-title">
+                            <span class="status-spinner"></span>
+                            <span id="status-title-text">System Busy</span>
+                        </div>
+                        <div class="status-details">
+                            <span id="status-operation">Unknown operation</span> 
+                            <span id="status-progress"></span>
+                            <span id="status-elapsed"></span>
+                            <span id="status-waiters"></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
             
             <div class="stats">
                 <div class="stat-card">
@@ -461,6 +546,7 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                     </select>
                 </label>
                 <button onclick="triggerScrape()" class="btn btn-primary btn-sm">🔍 Scrape Now</button>
+                <button onclick="cleanupSchedule()" class="btn btn-danger btn-sm">🧹 Clean Schedule</button>
                 <button onclick="regenerateAllMissing()" class="btn btn-primary btn-sm">🤖 Generate Missing Variants</button>
                 <button onclick="window.location.reload()" class="btn btn-primary btn-sm">🔄 Refresh</button>
             </div>
@@ -596,6 +682,31 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                 }}
             }}
             
+            async function postNow(scheduledPostId) {{
+                if (!confirm('📤 Post this immediately to LinkedIn?\\n\\nThis will publish the post right now, bypassing the schedule.')) return;
+                
+                document.body.style.cursor = 'wait';
+                
+                try {{
+                    const response = await fetch(`/admin/scheduled/${{scheduledPostId}}/post-now`, {{
+                        method: 'POST'
+                    }});
+                    
+                    if (response.ok) {{
+                        const data = await response.json();
+                        alert('✅ ' + data.message);
+                        window.location.reload();
+                    }} else {{
+                        const error = await response.json();
+                        alert('❌ Error: ' + (error.detail || 'Failed to post'));
+                    }}
+                }} catch (err) {{
+                    alert('❌ Network error: ' + err.message);
+                }} finally {{
+                    document.body.style.cursor = 'default';
+                }}
+            }}
+            
             function filterPosts() {{
                 const status = document.getElementById('statusFilter').value;
                 const author = document.getElementById('authorFilter').value;
@@ -653,6 +764,137 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                     document.body.style.cursor = 'default';
                 }}
             }}
+            
+            async function cleanupSchedule() {{
+                document.body.style.cursor = 'wait';
+                
+                try {{
+                    // First, preview what would be removed
+                    const previewResponse = await fetch('/admin/cleanup-schedule?preview=true', {{
+                        method: 'POST'
+                    }});
+                    
+                    if (!previewResponse.ok) {{
+                        const error = await previewResponse.json();
+                        alert('❌ Error: ' + (error.detail || 'Failed to preview cleanup'));
+                        return;
+                    }}
+                    
+                    const preview = await previewResponse.json();
+                    
+                    if (preview.dead_posts.length === 0) {{
+                        alert('✅ No DEAD posts to remove!\\n\\nYour schedule is clean.');
+                        return;
+                    }}
+                    
+                    // Build confirmation message
+                    let message = `🧹 Clean Schedule\\n\\n`;
+                    message += `Found ${{preview.dead_posts.length}} DEAD posts (>7 days old) to remove:\\n\\n`;
+                    
+                    preview.dead_posts.slice(0, 5).forEach(post => {{
+                        message += `• ${{post.author}} (age: ${{post.age_days}}d, priority: ${{post.priority}})\\n`;
+                    }});
+                    
+                    if (preview.dead_posts.length > 5) {{
+                        message += `... and ${{preview.dead_posts.length - 5}} more\\n`;
+                    }}
+                    
+                    message += `\\nAlso found ${{preview.stale_posts.length}} STALE posts (2-7 days) that will be kept.\\n`;
+                    message += `${{preview.protected_posts.length}} URGENT posts are protected and will not be removed.\\n`;
+                    message += `\\nProceed with cleanup?`;
+                    
+                    if (!confirm(message)) return;
+                    
+                    // Actually perform the cleanup
+                    const cleanupResponse = await fetch('/admin/cleanup-schedule?preview=false', {{
+                        method: 'POST'
+                    }});
+                    
+                    if (cleanupResponse.ok) {{
+                        const result = await cleanupResponse.json();
+                        alert('✅ ' + result.message);
+                        window.location.reload();
+                    }} else {{
+                        const error = await cleanupResponse.json();
+                        alert('❌ Error: ' + (error.detail || 'Failed to cleanup'));
+                    }}
+                }} catch (err) {{
+                    alert('❌ Network error: ' + err.message);
+                }} finally {{
+                    document.body.style.cursor = 'default';
+                }}
+            }}
+            
+            // Status polling
+            let statusPollInterval = null;
+            
+            async function updateStatus() {{
+                try {{
+                    const response = await fetch('/admin/status');
+                    if (!response.ok) return;
+                    
+                    const status = await response.json();
+                    const banner = document.getElementById('status-banner');
+                    
+                    if (status.is_locked) {{
+                        // Show banner
+                        banner.className = 'active ' + (status.operation || 'locked');
+                        
+                        // Update title
+                        const titleMap = {{
+                            'scraping': '🔍 Scraping LinkedIn Profiles',
+                            'posting': '📤 Posting to LinkedIn',
+                            'manual_login': '🔐 Manual Login in Progress',
+                        }};
+                        document.getElementById('status-title-text').textContent = 
+                            titleMap[status.operation] || '⏳ System Busy';
+                        
+                        // Update operation
+                        document.getElementById('status-operation').textContent = 
+                            status.operation || 'Unknown operation';
+                        
+                        // Update progress
+                        const progressEl = document.getElementById('status-progress');
+                        if (status.current_progress) {{
+                            progressEl.textContent = '• ' + status.current_progress;
+                            progressEl.style.display = 'inline';
+                        }} else {{
+                            progressEl.style.display = 'none';
+                        }}
+                        
+                        // Update elapsed time
+                        const elapsedEl = document.getElementById('status-elapsed');
+                        if (status.elapsed_seconds) {{
+                            const minutes = Math.floor(status.elapsed_seconds / 60);
+                            const seconds = status.elapsed_seconds % 60;
+                            elapsedEl.textContent = `• Running for ${{minutes}}m ${{seconds}}s`;
+                            elapsedEl.style.display = 'inline';
+                        }} else {{
+                            elapsedEl.style.display = 'none';
+                        }}
+                        
+                        // Update waiters
+                        const waitersEl = document.getElementById('status-waiters');
+                        if (status.waiters > 0) {{
+                            waitersEl.textContent = `• ${{status.waiters}} operation(s) waiting`;
+                            waitersEl.style.display = 'inline';
+                        }} else {{
+                            waitersEl.style.display = 'none';
+                        }}
+                    }} else {{
+                        // Hide banner
+                        banner.className = '';
+                    }}
+                }} catch (err) {{
+                    console.error('Status poll error:', err);
+                }}
+            }}
+            
+            // Poll every 2 seconds
+            statusPollInterval = setInterval(updateStatus, 2000);
+            
+            // Initial status check
+            updateStatus();
         </script>
     </body>
     </html>
