@@ -618,14 +618,32 @@ class LinkedInAutomation:
                 logger.warning("⚠️  No post elements found")
                 return []
             
+            # Save page HTML and screenshot for debugging
+            if handle.startswith("company/"):
+                company_name = handle.replace("company/", "").replace("/", "-")
+                html_file = f"/app/data/company_page_{company_name}.html"
+                screenshot_file = f"/app/data/company_page_{company_name}.png"
+                
+                page_html = await self.page.content()
+                with open(html_file, 'w', encoding='utf-8') as f:
+                    f.write(page_html)
+                logger.info(f"💾 Saved company page HTML to {html_file}")
+                
+                await self.page.screenshot(path=screenshot_file, full_page=True)
+                logger.info(f"📸 Saved company page screenshot to {screenshot_file}")
+            
             for element in post_elements[:max_posts]:
                 try:
                     # Extract post data
                     post_data = await self._extract_post_data(element, handle, author_name)
                     
-                    if post_data and post_data.post_date >= cutoff_date:
-                        posts.append(post_data)
-                        logger.info(f"✅ Scraped post: {post_data.content[:50]}...")
+                    if post_data:
+                        logger.info(f"📅 Post date: {post_data.post_date}, Cutoff: {cutoff_date}")
+                        if post_data.post_date >= cutoff_date:
+                            posts.append(post_data)
+                            logger.info(f"✅ Scraped post: {post_data.content[:50]}...")
+                        else:
+                            logger.info(f"⏭️  Skipping old post (older than {days_back} days)")
                     
                 except Exception as e:
                     logger.warning(f"⚠️  Failed to extract post data: {e}")
@@ -805,24 +823,50 @@ class LinkedInAutomation:
                 if link:
                     post_url = await link.get_attribute("href")
             
+            logger.debug(f"🔍 DEBUG: post_url = {post_url}")
+            
             # Extract author name (use provided name or scrape from page)
             if not author_name:
                 author_elem = await element.query_selector('.update-components-actor__name, .feed-shared-actor__name')
                 author_name = await author_elem.inner_text() if author_elem else "Unknown"
             
-            # Extract post content
-            content_elem = await element.query_selector('.feed-shared-update-v2__description, .update-components-text')
-            content = await content_elem.inner_text() if content_elem else ""
+            logger.debug(f"🔍 DEBUG: author_name = {author_name}")
+            
+            # Extract post content - try multiple selectors
+            content = ""
+            content_selectors = [
+                # For company pages - nested structure
+                '.feed-shared-update-v2__description .update-components-text span[dir="ltr"]',
+                '.feed-shared-update-v2__description span[dir="ltr"]',
+                # For simpler layouts
+                '.update-components-text span[dir="ltr"]',
+                '.update-components-text',
+                '.feed-shared-update-v2__description',
+                '.feed-shared-text',
+                'span[dir="ltr"]',
+            ]
+            
+            for selector in content_selectors:
+                content_elem = await element.query_selector(selector)
+                if content_elem:
+                    content = await content_elem.inner_text()
+                    if content and len(content.strip()) > 0:
+                        logger.info(f"✅ Found content with selector '{selector}'")
+                        logger.debug(f"🔍 DEBUG: Content preview: {content[:100]}")
+                        break
+            
+            if not content or len(content.strip()) == 0:
+                logger.warning(f"⚠️  No content found for post. Tried selectors: {content_selectors}")
+                return None
             
             # Extract timestamp
             time_elem = await element.query_selector('time, .update-components-actor__sub-description')
             time_text = await time_elem.inner_text() if time_elem else ""
             
+            logger.debug(f"🔍 DEBUG: time_text = {time_text}")
+            
             # Parse relative time
             post_date = self._parse_relative_time(time_text)
-            
-            if not content:
-                return None
             
             return LinkedInPost(
                 url=post_url or f"https://www.linkedin.com/in/{handle}/",
@@ -833,7 +877,7 @@ class LinkedInAutomation:
             )
             
         except Exception as e:
-            logger.warning(f"⚠️  Error extracting post data: {e}")
+            logger.warning(f"⚠️  Error extracting post data: {e}", exc_info=True)
             return None
     
     def _parse_relative_time(self, time_text: str) -> datetime:

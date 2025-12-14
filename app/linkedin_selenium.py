@@ -847,9 +847,9 @@ Alternative: Connect via VNC client to localhost:5900
             
             # NOW: Navigate to posts/activity page
             if handle.startswith("company/"):
-                # Company page format: /company/{handle}/posts/
+                # Company page format: /company/{handle}/posts/?feedView=all
                 company_handle = handle.replace("company/", "")
-                profile_url = f"https://www.linkedin.com/company/{company_handle}/posts/"
+                profile_url = f"https://www.linkedin.com/company/{company_handle}/posts/?feedView=all"
                 logger.info(f"🏢 Navigating to company posts: {company_handle}...")
             else:
                 # Personal profile format: /in/{handle}/recent-activity/all/
@@ -857,6 +857,7 @@ Alternative: Connect via VNC client to localhost:5900
                 logger.info(f"🔍 Navigating to recent activity: {handle}...")
             
             self.driver.get(profile_url)
+            logger.info(f"📍 Navigated to URL: {self.driver.current_url}")
             
             # Check for security challenge after navigation
             if self._check_for_security_challenge():
@@ -865,8 +866,12 @@ Alternative: Connect via VNC client to localhost:5900
                 # The challenge will need to be handled by the async wrapper
                 raise Exception(f"LinkedIn security challenge detected for {handle}")
             
-            # Wait for page load
-            time.sleep(5)
+            # Wait longer for company pages to load (JavaScript-heavy)
+            if handle.startswith("company/"):
+                logger.info("⏳ Waiting 10 seconds for company page to load...")
+                time.sleep(10)
+            else:
+                time.sleep(5)
             
             # Scroll to load posts
             for _ in range(3):
@@ -1467,7 +1472,7 @@ Alternative: Connect via VNC client to localhost:5900
             # Support company pages with company/ prefix
             if author_handle.startswith("company/"):
                 company_handle = author_handle.replace("company/", "")
-                profile_url = f"https://www.linkedin.com/company/{company_handle}/posts/"
+                profile_url = f"https://www.linkedin.com/company/{company_handle}/posts/?feedView=all"
                 logger.info(f"🏢 Navigating to company page: {profile_url}")
             else:
                 profile_url = f"https://www.linkedin.com/in/{author_handle}/recent-activity/all/"
