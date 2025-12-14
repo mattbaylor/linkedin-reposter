@@ -89,7 +89,9 @@ class GitHubCopilotAIService:
         self,
         original_content: str,
         author_name: str,
-        num_variants: int = 3
+        num_variants: int = 3,
+        relationship: Optional[str] = None,
+        custom_context: Optional[str] = None
     ) -> List[str]:
         """
         Generate alternative versions of a LinkedIn post using GitHub Copilot.
@@ -98,6 +100,8 @@ class GitHubCopilotAIService:
             original_content: The original post content
             author_name: Name of the original post author
             num_variants: Number of variants to generate (default: 3)
+            relationship: Type of relationship with the author (e.g., "mentor", "colleague")
+            custom_context: Additional context about the author
         
         Returns:
             List of generated post variants
@@ -114,7 +118,7 @@ class GitHubCopilotAIService:
         )
         
         try:
-            prompt = self._create_prompt(original_content, author_name, num_variants)
+            prompt = self._create_prompt(original_content, author_name, num_variants, relationship, custom_context)
             
             # Get a valid bearer token (exchange refresh token if needed)
             bearer_token = await self._get_bearer_token()
@@ -193,18 +197,29 @@ class GitHubCopilotAIService:
             log_operation_error(logger, "generate_variants_copilot", e)
             raise
     
-    def _create_prompt(self, original_content: str, author_name: str, num_variants: int) -> str:
+    def _create_prompt(self, original_content: str, author_name: str, num_variants: int, relationship: Optional[str] = None, custom_context: Optional[str] = None) -> str:
         """
         Create the prompt for generating post variants.
         
         Uses the same prompt as the GitHub Models service for consistency.
         """
+        # Build relationship context for the prompt
+        relationship_context = ""
+        if relationship or custom_context:
+            relationship_context = "\n\nAUTHOR CONTEXT:"
+            if relationship:
+                relationship_context += f"\n- Your relationship: {relationship}"
+            if custom_context:
+                relationship_context += f"\n- Additional context: {custom_context}"
+            relationship_context += "\n- Use this context to personalize your tone and add credibility when sharing their insights"
+        
         return f"""I need you to create {num_variants} alternative versions of the following LinkedIn post.
 
 ORIGINAL POST by {author_name}:
 ---
 {original_content}
 ---
+{relationship_context}
 
 REQUIREMENTS:
 1. Create {num_variants} distinct variants that maintain the core message
