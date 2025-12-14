@@ -201,65 +201,91 @@ class GitHubCopilotAIService:
         """
         Create the prompt for generating post variants.
         
-        Uses the same prompt as the GitHub Models service for consistency.
+        Uses relationship context to create more authentic, personalized variants.
         """
-        # Build relationship context for the prompt
-        relationship_context = ""
+        # Build relationship-aware context
+        relationship_guidance = ""
         if relationship or custom_context:
-            relationship_context = "\n\nAUTHOR CONTEXT:"
+            # Map relationships to authentic sharing approaches
+            relationship_map = {
+                "colleague": "You work with them. Share their insights naturally like you would in a hallway conversation with mutual colleagues.",
+                "manager": "They lead your team. Amplify their message with respect while adding your own perspective.",
+                "former_manager": "They mentored you before. Reference their impact and share why their insights still matter.",
+                "mentor": "They guide your career. Show genuine appreciation and explain how their thinking helps you.",
+                "teammate": "You're on the same team. Champion their work like you'd support them in a meeting.",
+                "industry_leader": "You respect their expertise. Share their insights as someone who learns from them.",
+                "thought_leader": "You follow their work closely. Explain why their perspective matters to you.",
+                "collaborator": "You work together regularly. Highlight their expertise from your direct experience.",
+                "friend": "You're friends. Share their post like you'd recommend their work to someone over coffee.",
+                "other": "You know them professionally. Share their insights authentically."
+            }
+            
+            sharing_approach = relationship_map.get(relationship.lower() if relationship else "", "Share their insights authentically.")
+            
+            relationship_guidance = f"\n\nCONTEXT ABOUT {author_name}:"
             if relationship:
-                relationship_context += f"\n- Your relationship: {relationship}"
+                relationship_guidance += f"\n- Relationship: {relationship}"
             if custom_context:
-                relationship_context += f"\n- Additional context: {custom_context}"
-            relationship_context += "\n- Use this context to personalize your tone and add credibility when sharing their insights"
+                relationship_guidance += f"\n- Background: {custom_context}"
+            relationship_guidance += f"\n- Sharing approach: {sharing_approach}"
+            relationship_guidance += "\n- Use this context to sound natural and authentic, not promotional or formulaic"
         
-        return f"""I need you to create {num_variants} alternative versions of the following LinkedIn post.
+        return f"""You're helping someone share a colleague's LinkedIn post on their own profile. The goal is to sound NATURAL and AUTHENTIC - like a real person sharing something they found valuable, not like a marketing template.
 
 ORIGINAL POST by {author_name}:
 ---
 {original_content}
 ---
-{relationship_context}
+{relationship_guidance}
 
-REQUIREMENTS:
-1. Create {num_variants} distinct variants that maintain the core message
-2. Each variant should have a different tone or angle:
-   - Variant 1: Professional and formal
-   - Variant 2: Enthusiastic and energetic
-   - Variant 3: Conversational and approachable
-3. Keep the same hashtags or suggest similar relevant ones
-4. **IMPORTANT - SUMMARIZE**: Make the variants more concise than the original
-   - Focus on the key insight or takeaway
-   - Aim for 30-50% shorter than the original while keeping the main point
-   - Remove unnecessary details or repetition
-5. Preserve any emojis or use similar appropriate ones
-6. Each variant should feel authentic and engaging
-7. **IMPORTANT - THIRD PERSON**: Convert first-person perspective to third-person perspective
-   - Reference the original poster by their FULL NAME: "{author_name}"
-   - Example: "I believe..." → "{author_name} believes..."
-   - Example: "In my experience..." → "In {author_name}'s experience..."
-   - Example: "I've seen..." → "{author_name} has seen..."
-   - Use their actual name (e.g., "Tim Cool", "Elena Dietrich"), NOT their handle (e.g., NOT "timcool" or "@timcool")
-8. DO NOT include any meta-commentary, explanations, or labels like "Variant 1:", "Option 1:", etc.
-9. Separate each variant with exactly "---VARIANT---" on its own line
+CREATE {num_variants} AUTHENTIC VARIANTS:
+
+CRITICAL AUTHENTICITY RULES:
+1. **SOUND HUMAN**: Avoid marketing speak, buzzwords, and hype language
+   - DON'T say: "game-changer", "excited to share", "thrilled to announce", "proud to", "honored to"
+   - DON'T use excessive emojis or punctuation (!!!)
+   - DON'T be overly enthusiastic or promotional
+   - DO sound like a real person having a genuine conversation
+   - DO use natural language someone would actually say
+
+2. **MAKE IT PERSONAL**: Reference {author_name} naturally
+   - DON'T say: "{author_name} shared some great insights..." (too formal)
+   - DO say: "{author_name} nailed this" or "{author_name} makes a good point about..." (natural)
+   - DON'T introduce them by full title every time
+   - DO refer to them by first name after first mention if appropriate to relationship
+
+3. **BE CONCISE**: Cut to the core insight
+   - Aim for 40-60% of the original length
+   - One key idea + why it matters = done
+   - Remove fluff, repetition, and obvious statements
+
+4. **VARY YOUR APPROACH** (create {num_variants} different takes):
+   - Variant 1: Direct and matter-of-fact (just share the insight, minimal commentary)
+   - Variant 2: Add personal context (connect to your own experience or observation)
+   - Variant 3: Provocative or contrarian (challenge conventional thinking or status quo)
+
+5. **NO FORMULAS**: Don't follow templates like:
+   - ❌ "I recently came across..."
+   - ❌ "Want to share this insight from..."
+   - ❌ "Here's why this matters..."
+   - ✅ Just start with the idea or insight directly
+
+6. **HASHTAGS**: Keep them minimal and relevant (2-3 max), or remove them entirely if the post feels more authentic without them
 
 OUTPUT FORMAT:
-Return exactly {num_variants} variants separated by ---VARIANT--- markers, with no additional text, explanations, or labels.
+Return exactly {num_variants} variants separated by ---VARIANT--- on its own line.
+NO labels like "Variant 1:", NO explanations, NO commentary about the variants.
+Just the raw post text.
 
-Example output format:
-This is the first concise variant text here referencing {author_name}.
+Example of what authentic posts sound like:
 
-#Hashtag1 #Hashtag2
----VARIANT---
-This is the second summarized variant text here with {author_name}'s perspective.
+Bad (formulaic):
+"I'm excited to share this insightful post from {author_name}! They make a great point about leadership. #Leadership #Insight"
 
-#Hashtag1 #Hashtag2
----VARIANT---
-This is the third condensed variant text here about what {author_name} thinks.
+Good (authentic):
+"{author_name}'s take on leadership here - the part about listening more than talking hits hard."
 
-#Hashtag1 #Hashtag2
-
-Now generate the {num_variants} variants:"""
+Now generate {num_variants} authentic variants:"""
     
     def _parse_variants(self, content: str, expected_count: int) -> List[str]:
         """
