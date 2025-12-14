@@ -569,14 +569,24 @@ class LinkedInAutomation:
             # Construct profile URL
             if handle.startswith("http"):
                 profile_url = handle
+            elif handle.startswith("company/"):
+                # Company page format: /company/{handle}/posts/?feedView=all
+                company_handle = handle.replace("company/", "")
+                profile_url = f"https://www.linkedin.com/company/{company_handle}/posts/?feedView=all"
+                logger.info(f"🏢 Navigating to company posts: {company_handle}")
             else:
                 profile_url = f"https://www.linkedin.com/in/{handle}/recent-activity/all/"
             
             log_workflow_step(logger, f"Navigating to {handle}'s profile")
             await self.page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
+            logger.info(f"📍 Navigated to URL: {self.page.url}")
             
-            # Wait for posts to load
-            await asyncio.sleep(3)
+            # Wait longer for company pages to load (JavaScript-heavy)
+            if handle.startswith("company/"):
+                logger.info("⏳ Waiting 10 seconds for company page to fully load...")
+                await asyncio.sleep(10)
+            else:
+                await asyncio.sleep(3)
             
             # Scroll to load more posts
             log_workflow_step(logger, "Scrolling to load posts")
