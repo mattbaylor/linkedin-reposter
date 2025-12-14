@@ -295,7 +295,7 @@ async def check_and_publish_posts():
         chrome_lock.release()
 
 
-async def scheduled_scrape_and_process():
+async def scheduled_scrape_and_process(test_handle: Optional[str] = None):
     """
     Scheduled background task to scrape LinkedIn posts and process them.
     
@@ -303,8 +303,12 @@ async def scheduled_scrape_and_process():
     1. Scrapes posts from all monitored handles (from database)
     2. Generates AI variants for each post
     3. Sends approval emails to the user
+    
+    Args:
+        test_handle: Optional handle to scrape only (for testing). If provided, only this handle will be scraped.
     """
-    log_operation_start(logger, "scheduled_scrape_and_process")
+    operation_name = f"test_scrape_{test_handle}" if test_handle else "scheduled_scrape_and_process"
+    log_operation_start(logger, operation_name)
     
     settings = get_settings()
     
@@ -312,16 +316,31 @@ async def scheduled_scrape_and_process():
     async for db in get_db():
         # Fetch active monitored handles from database
         from app.models import MonitoredHandle
-        result = await db.execute(
-            select(MonitoredHandle).where(MonitoredHandle.is_active == True)
-        )
-        monitored_handles = result.scalars().all()
         
-        if not monitored_handles:
-            logger.warning("⚠️  No active monitored handles found in database")
-            return
+        if test_handle:
+            # Test mode: fetch only the specific handle
+            result = await db.execute(
+                select(MonitoredHandle).where(
+                    MonitoredHandle.handle == test_handle,
+                    MonitoredHandle.is_active == True
+                )
+            )
+            monitored_handles = result.scalars().all()
+            if not monitored_handles:
+                logger.error(f"❌ Test handle '{test_handle}' not found or not active")
+                return
+            logger.info(f"🧪 TEST MODE: Scraping only @{test_handle}")
+        else:
+            # Normal mode: fetch all active handles
+            result = await db.execute(
+                select(MonitoredHandle).where(MonitoredHandle.is_active == True)
+            )
+            monitored_handles = result.scalars().all()
+            if not monitored_handles:
+                logger.warning("⚠️  No active monitored handles found in database")
+                return
+            logger.info(f"🔍 Starting scheduled scrape for {len(monitored_handles)} handles")
         
-        logger.info(f"🔍 Starting scheduled scrape for {len(monitored_handles)} handles")
         break  # Just need the first session
     
     # Import health monitoring
@@ -1400,18 +1419,120 @@ async def admin_open_browser(url: str = "https://www.linkedin.com/feed/"):
 
 
 @app.post("/admin/trigger-scrape")
-async def admin_trigger_scrape(db: AsyncSession = Depends(get_db)):
-    """Manually trigger a scrape of all monitored LinkedIn handles."""
-    log_operation_start(logger, "admin_trigger_scrape")
+async def admin_trigger_scrape(
+    handle: Optional[str] = Query(None, description="Optional: specific handle to scrape (e.g., 'timcool' or 'company/smartchurchsolutions')"),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Manually trigger a scrape of monitored LinkedIn handles.
+    
+    Query params:
+    - handle: Optional. If provided, only scrapes this specific handle. Otherwise scrapes all active handles.
+    """
+    log_operation_start(logger, "admin_trigger_scrape", handle=handle or "all")
     
     # Run the scrape in the background so we can return immediately
-    asyncio.create_task(scheduled_scrape_and_process())
+    asyncio.create_task(scheduled_scrape_and_process(test_handle=handle))
     
-    log_operation_success(logger, "admin_trigger_scrape", status="started")
+    log_operation_success(logger, "admin_trigger_scrape", handle=handle or "all", status="started")
+    
+    if handle:
+        return {
+            "success": True,
+            "message": f"Scraping started for handle: {handle}",
+            "handle": handle
+        }
+    else:
+        return {
+            "success": True,
+            "message": "Scraping started for all monitored handles"
+        }
+
+
+@app.post("/admin/test-scrape-handle")
+async def admin_test_scrape_handle(
+    handle: str = Query(..., description="LinkedIn handle to scrape (e.g., 'timcool' or 'company/smartchurchsolutions')"),
+    db: AsyncSession = Depends(get_db)
+):
+    """Test endpoint to scrape a specific handle without processing all handles."""
+    log_operation_start(logger, "admin_test_scrape_handle", handle=handle)
+    
+    from app.models import MonitoredHandle
+    
+    # Look up the handle in the database
+    result = await db.execute(
+        select(MonitoredHandle).where(
+            MonitoredHandle.handle == handle,
+            MonitoredHandle.is_active == True
+        )
+    )
+    monitored_handle = result.scalar_one_or_none()
+    
+    if not monitored_handle:
+        raise HTTPException(status_code=404, detail=f"Handle '{handle}' not found or not active")
+    
+    # Run scrape in background for just this handle
+    async def scrape_single_handle():
+        from app.health_monitor import update_last_successful_scrape
+        from app.utils import fuzzy_match
+        
+        chrome_lock = get_chrome_lock()
+        await chrome_lock.acquire(operation="test-scraping", locked_by=f"test_scrape_{handle}")
+        
+        try:
+            async for db_session in get_db():
+                try:
+                    linkedin = get_linkedin_service()
+                    await linkedin.start()
+                    
+                    try:
+                        display_name = monitored_handle.display_name or "Unknown"
+                        relationship = monitored_handle.relationship
+                        custom_context = monitored_handle.custom_context
+                        
+                        logger.info(f"🧪 TEST: Scraping @{handle} ({display_name})...")
+                        
+                        posts = await linkedin.scrape_user_posts(
+                            handle=handle,
+                            max_posts=10,
+                            days_back=7,
+                            author_name=display_name
+                        )
+                        
+                        logger.info(f"✅ TEST: Scraped {len(posts)} posts from @{handle}")
+                        
+                        # Update timestamp
+                        monitored_handle.last_scraped_at = datetime.utcnow()
+                        await db_session.commit()
+                        
+                        # Process posts (just log, don't save or generate variants)
+                        for idx, post_data in enumerate(posts, 1):
+                            logger.info(f"📄 Post {idx}/{len(posts)}: {post_data.content[:100]}...")
+                        
+                        logger.info(f"✅ TEST COMPLETE: Found {len(posts)} posts from @{handle}")
+                        
+                    finally:
+                        await linkedin.stop()
+                        
+                except Exception as e:
+                    logger.error(f"❌ TEST FAILED: {str(e)}", exc_info=True)
+                    raise
+                finally:
+                    break
+                    
+        finally:
+            await chrome_lock.release()
+    
+    # Start background task
+    asyncio.create_task(scrape_single_handle())
+    
+    log_operation_success(logger, "admin_test_scrape_handle", handle=handle, status="started")
     
     return {
         "success": True,
-        "message": "Scraping started in background"
+        "message": f"Test scrape started for handle: {handle}",
+        "handle": handle,
+        "display_name": monitored_handle.display_name
     }
 
 
