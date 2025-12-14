@@ -237,14 +237,9 @@ Now that the database and core API are complete, we can proceed to Phase 3:
 - **Secrets Loaded**: 9/9 ✅
 
 ### Monitoring Configuration
-LinkedIn handles (7 total):
-1. timcool
-2. smartchurchsolutions
-3. elena-dietrich-b95b64249
-4. patrick-hart-b6835958
-5. nathan-parr-15504b43
-6. tyler-david-thompson
-7. espace-facility-management-software
+LinkedIn handles are stored in the `monitored_handles` database table.
+Handles can be managed via the admin dashboard or API endpoints.
+Supports monitoring both individual profiles and company pages.
 
 ---
 

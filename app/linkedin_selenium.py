@@ -773,72 +773,77 @@ Alternative: Connect via VNC client to localhost:5900
         self,
         handle: str,
         max_posts: int = 10,
-        days_back: int = 7
+        days_back: int = 7,
+        author_name: Optional[str] = None
     ) -> List[LinkedInPost]:
         """Scrape posts from a user (sync)."""
         try:
             if not self.is_logged_in:
                 raise Exception("Not logged in")
             
-            # FIRST: Visit main profile page to extract author name
-            author_name = handle.replace('-', ' ').replace('company/', '').title()  # Default fallback
-            
-            if handle.startswith("company/"):
-                company_handle = handle.replace("company/", "")
-                name_page_url = f"https://www.linkedin.com/company/{company_handle}/"
-                logger.info(f"📝 Visiting company page to get name: {company_handle}...")
+            # Use provided author_name if available, otherwise scrape it
+            if author_name:
+                logger.info(f"✅ Using provided author name: {author_name}")
             else:
-                name_page_url = f"https://www.linkedin.com/in/{handle}/"
-                logger.info(f"📝 Visiting profile page to get name: {handle}...")
+                # FIRST: Visit main profile page to extract author name
+                author_name = handle.replace('-', ' ').replace('company/', '').title()  # Default fallback
             
-            self.driver.get(name_page_url)
-            time.sleep(3)
+                if handle.startswith("company/"):
+                    company_handle = handle.replace("company/", "")
+                    name_page_url = f"https://www.linkedin.com/company/{company_handle}/"
+                    logger.info(f"📝 Visiting company page to get name: {company_handle}...")
+                else:
+                    name_page_url = f"https://www.linkedin.com/in/{handle}/"
+                    logger.info(f"📝 Visiting profile page to get name: {handle}...")
             
-            # Extract name from profile page
-            from bs4 import BeautifulSoup
-            name_page_html = self.driver.page_source
-            name_soup = BeautifulSoup(name_page_html, 'html.parser')
+                self.driver.get(name_page_url)
+                time.sleep(3)
             
-            # Try multiple strategies to find the name
-            extracted_name = None
+                # Extract name from profile page
+                from bs4 import BeautifulSoup
+                name_page_html = self.driver.page_source
+                name_soup = BeautifulSoup(name_page_html, 'html.parser')
             
-            # Strategy 1: Look for h1 with the person's name
-            name_header = name_soup.find('h1', class_=lambda c: c and 'text-heading-xlarge' in str(c))
-            if name_header:
-                extracted_name = name_header.get_text(strip=True)
-                logger.debug("Found name in h1 with text-heading-xlarge")
+                # Try multiple strategies to find the name
+                extracted_name = None
             
-            # Strategy 2: Look for h1 with top-card class (common on profiles)
-            if not extracted_name:
-                name_header = name_soup.find('h1', class_=lambda c: c and 'top-card' in str(c))
+                # Strategy 1: Look for h1 with the person's name
+                name_header = name_soup.find('h1', class_=lambda c: c and 'text-heading-xlarge' in str(c))
                 if name_header:
                     extracted_name = name_header.get_text(strip=True)
-                    logger.debug("Found name in h1 with top-card")
+                    logger.debug("Found name in h1 with text-heading-xlarge")
             
-            # Strategy 3: Look in page title (fallback)
-            if not extracted_name:
-                title = name_soup.find('title')
-                if title:
-                    title_text = title.get_text()
-                    # Title format: "(X) Name | LinkedIn" or "Name | LinkedIn"
-                    if '|' in title_text:
-                        parts = title_text.split('|')
-                        if len(parts) >= 2:
-                            name_part = parts[0].strip()
-                            # Remove notification count like "(24)"
-                            import re
-                            name_part = re.sub(r'^\(\d+\)\s*', '', name_part)
-                            # Remove trailing text like "Activity" or "Posts"
-                            name_part = re.sub(r'\s+(Activity|Posts|Profile)$', '', name_part)
-                            if name_part and len(name_part) > 3:
-                                extracted_name = name_part
-                                logger.debug(f"Found name in title: {extracted_name}")
+                # Strategy 2: Look for h1 with top-card class (common on profiles)
+                if not extracted_name:
+                    name_header = name_soup.find('h1', class_=lambda c: c and 'top-card' in str(c))
+                    if name_header:
+                        extracted_name = name_header.get_text(strip=True)
+                        logger.debug("Found name in h1 with top-card")
             
-            if extracted_name and len(extracted_name) > 3:
-                author_name = extracted_name
-                logger.info(f"✅ Extracted author name: {author_name}")
-            else:
-                logger.warning(f"⚠️  Could not find name on profile page, using fallback: {author_name}")
+                # Strategy 3: Look in page title (fallback)
+                if not extracted_name:
+                    title = name_soup.find('title')
+                    if title:
+                        title_text = title.get_text()
+                        # Title format: "(X) Name | LinkedIn" or "Name | LinkedIn"
+                        if '|' in title_text:
+                            parts = title_text.split('|')
+                            if len(parts) >= 2:
+                                name_part = parts[0].strip()
+                                # Remove notification count like "(24)"
+                                import re
+                                name_part = re.sub(r'^\(\d+\)\s*', '', name_part)
+                                # Remove trailing text like "Activity" or "Posts"
+                                name_part = re.sub(r'\s+(Activity|Posts|Profile)$', '', name_part)
+                                if name_part and len(name_part) > 3:
+                                    extracted_name = name_part
+                                    logger.debug(f"Found name in title: {extracted_name}")
+            
+                if extracted_name and len(extracted_name) > 3:
+                    author_name = extracted_name
+                    logger.info(f"✅ Extracted author name: {author_name}")
+                else:
+                    logger.warning(f"⚠️  Could not find name on profile page, using fallback: {author_name}")
             
             # NOW: Navigate to posts/activity page
             if handle.startswith("company/"):
@@ -1084,7 +1089,8 @@ Alternative: Connect via VNC client to localhost:5900
         self,
         handle: str,
         max_posts: int = 10,
-        days_back: int = 7
+        days_back: int = 7,
+        author_name: Optional[str] = None
     ) -> List[LinkedInPost]:
         """Scrape posts from a user (async wrapper)."""
         log_operation_start(logger, "selenium_scrape_posts", handle=handle, max_posts=max_posts)
@@ -1097,7 +1103,8 @@ Alternative: Connect via VNC client to localhost:5900
                 self._scrape_user_posts,
                 handle,
                 max_posts,
-                days_back
+                days_back,
+                author_name
             )
             
             log_operation_success(logger, "selenium_scrape_posts", posts_count=len(posts))

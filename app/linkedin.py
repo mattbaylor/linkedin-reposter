@@ -540,7 +540,8 @@ class LinkedInAutomation:
         self,
         handle: str,
         max_posts: int = 10,
-        days_back: int = 7
+        days_back: int = 7,
+        author_name: Optional[str] = None
     ) -> List[LinkedInPost]:
         """
         Scrape recent posts from a LinkedIn user.
@@ -572,7 +573,7 @@ class LinkedInAutomation:
                 profile_url = f"https://www.linkedin.com/in/{handle}/recent-activity/all/"
             
             log_workflow_step(logger, f"Navigating to {handle}'s profile")
-            await self.page.goto(profile_url, wait_until="networkidle")
+            await self.page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
             
             # Wait for posts to load
             await asyncio.sleep(3)
@@ -610,7 +611,7 @@ class LinkedInAutomation:
             for element in post_elements[:max_posts]:
                 try:
                     # Extract post data
-                    post_data = await self._extract_post_data(element, handle)
+                    post_data = await self._extract_post_data(element, handle, author_name)
                     
                     if post_data and post_data.post_date >= cutoff_date:
                         posts.append(post_data)
@@ -775,7 +776,7 @@ class LinkedInAutomation:
         except Exception as e:
             logger.warning(f"⚠️  Failed to save session: {e}")
     
-    async def _extract_post_data(self, element, handle: str) -> Optional[LinkedInPost]:
+    async def _extract_post_data(self, element, handle: str, author_name: Optional[str] = None) -> Optional[LinkedInPost]:
         """
         Extract post data from a post element.
         
@@ -794,9 +795,10 @@ class LinkedInAutomation:
                 if link:
                     post_url = await link.get_attribute("href")
             
-            # Extract author name
-            author_elem = await element.query_selector('.update-components-actor__name, .feed-shared-actor__name')
-            author_name = await author_elem.inner_text() if author_elem else "Unknown"
+            # Extract author name (use provided name or scrape from page)
+            if not author_name:
+                author_elem = await element.query_selector('.update-components-actor__name, .feed-shared-actor__name')
+                author_name = await author_elem.inner_text() if author_elem else "Unknown"
             
             # Extract post content
             content_elem = await element.query_selector('.feed-shared-update-v2__description, .update-components-text')

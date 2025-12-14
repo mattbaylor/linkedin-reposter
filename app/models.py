@@ -42,6 +42,47 @@ class ScheduledPostStatus(str, enum.Enum):
     CANCELLED = "cancelled"      # User cancelled
 
 
+class RelationshipType(str, enum.Enum):
+    """Type of relationship with a monitored LinkedIn handle."""
+    # Direct Work Relationships
+    MANAGER = "manager"                      # Your direct manager
+    FORMER_MANAGER = "former_manager"        # Previous boss
+    COLLEAGUE = "colleague"                  # Current coworker
+    FORMER_COLLEAGUE = "former_colleague"    # Worked together before
+    TEAMMATE = "teammate"                    # Same team
+    
+    # Mentorship
+    MENTOR = "mentor"                        # Guides your career
+    MENTEE = "mentee"                        # Someone you mentor
+    PROFESSOR = "professor"                  # Academic advisor
+    
+    # Collaboration
+    COLLABORATOR = "collaborator"            # Work together regularly
+    COAUTHOR = "coauthor"                    # Published together
+    BUSINESS_PARTNER = "business_partner"    # Co-founder/partner
+    
+    # Thought Leadership
+    INDUSTRY_LEADER = "industry_leader"      # Prominent in your field
+    THOUGHT_LEADER = "thought_leader"        # Influential thinker
+    SUBJECT_EXPERT = "subject_expert"        # Domain expert
+    
+    # Client/Vendor
+    CLIENT = "client"                        # Your customer
+    VENDOR = "vendor"                        # Your service provider
+    
+    # Community
+    FRIEND = "friend"                        # Personal friend
+    ALUMNI = "alumni"                        # Same school/program
+    CONFERENCE_CONNECTION = "conference_connection"  # Met at events
+    
+    # Aspirational
+    ROLE_MODEL = "role_model"                # Career inspiration
+    FOLLOW = "follow"                        # You follow their work
+    
+    # Other
+    OTHER = "other"                          # Custom relationship
+
+
 class LinkedInPost(Base):
     """Original LinkedIn post scraped from monitored handles."""
     __tablename__ = "linkedin_posts"
@@ -258,5 +299,35 @@ class SystemHealth(Base):
     
     def __repr__(self) -> str:
         return f"<SystemHealth(last_post={self.last_successful_post_time}, scraped={self.total_posts_scraped}, posted={self.total_posts_posted})>"
+
+
+class MonitoredHandle(Base):
+    """LinkedIn handles to monitor for reposts with relationship context."""
+    __tablename__ = "monitored_handles"
+    
+    id: Mapped[int] = mapped_column(primary_key=True)
+    
+    # Handle information
+    handle: Mapped[str] = mapped_column(String(100), unique=True, index=True)  # e.g., "tylercowen"
+    display_name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)  # e.g., "Tyler Cowen"
+    
+    # Relationship context for AI personalization
+    relationship: Mapped[RelationshipType] = mapped_column(
+        SQLEnum(RelationshipType),
+        default=RelationshipType.OTHER,
+        index=True
+    )
+    custom_context: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # e.g., "PhD advisor, economist"
+    
+    # Status
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_scraped_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    
+    def __repr__(self) -> str:
+        status = "active" if self.is_active else "inactive"
+        return f"<MonitoredHandle(handle=@{self.handle}, relationship={self.relationship.value}, {status})>"
 
 

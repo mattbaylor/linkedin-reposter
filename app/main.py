@@ -33,6 +33,9 @@ from app.schemas import (
     ScheduledPostResponse,
     ScheduleQueueResponse,
     LinkedInCookieAuth,
+    MonitoredHandleCreate,
+    MonitoredHandleUpdate,
+    MonitoredHandleResponse,
 )
 from app.logging_config import (
     setup_logging,
@@ -244,13 +247,9 @@ async def check_and_publish_posts():
                 
                 logger.info(f"📬 Found {len(due_posts)} post(s) due for publishing")
                 
-                # Use Selenium service for reposting
+                # Use Playwright service for reposting
                 settings = get_settings()
-                linkedin = get_selenium_linkedin_service(
-                    headless=False,  # Always non-headless so VNC shows security challenges
-                    email=settings.linkedin_email,
-                    password=settings.linkedin_password
-                )
+                linkedin = get_linkedin_service()
                 
                 # Import health monitoring
                 from app.health_monitor import update_last_successful_post, increment_failed_posts
@@ -301,16 +300,29 @@ async def scheduled_scrape_and_process():
     Scheduled background task to scrape LinkedIn posts and process them.
     
     This function runs at 11am and 4pm MST/MDT and:
-    1. Scrapes posts from all monitored handles
+    1. Scrapes posts from all monitored handles (from database)
     2. Generates AI variants for each post
     3. Sends approval emails to the user
     """
     log_operation_start(logger, "scheduled_scrape_and_process")
     
     settings = get_settings()
-    handles = settings.linkedin_handles.split(',')
     
-    logger.info(f"🔍 Starting scheduled scrape for {len(handles)} handles")
+    # Get database session to fetch monitored handles
+    async for db in get_db():
+        # Fetch active monitored handles from database
+        from app.models import MonitoredHandle
+        result = await db.execute(
+            select(MonitoredHandle).where(MonitoredHandle.is_active == True)
+        )
+        monitored_handles = result.scalars().all()
+        
+        if not monitored_handles:
+            logger.warning("⚠️  No active monitored handles found in database")
+            return
+        
+        logger.info(f"🔍 Starting scheduled scrape for {len(monitored_handles)} handles")
+        break  # Just need the first session
     
     # Import health monitoring
     from app.health_monitor import update_last_successful_scrape
@@ -327,12 +339,8 @@ async def scheduled_scrape_and_process():
         # Get database session
         async for db in get_db():
             try:
-                # Get services
-                linkedin = get_selenium_linkedin_service(
-                    headless=False,  # Always non-headless so VNC shows security challenges
-                    email=settings.linkedin_email,
-                    password=settings.linkedin_password
-                )
+                # Get services (using Playwright for better stability)
+                linkedin = get_linkedin_service()
                 ai_service = get_ai_service()
                 email_service = get_email_service()
                 
@@ -340,25 +348,34 @@ async def scheduled_scrape_and_process():
                 await linkedin.start()
                 
                 try:
-                    # Scrape each handle
-                    for idx, handle in enumerate(handles):
-                        handle = handle.strip()
+                    # Scrape each monitored handle
+                    for idx, monitored_handle in enumerate(monitored_handles):
+                        handle = monitored_handle.handle
+                        display_name = monitored_handle.display_name or "Unknown"
+                        relationship = monitored_handle.relationship
+                        custom_context = monitored_handle.custom_context
                         
                         # Update progress
-                        chrome_lock.update_progress(f"Scraping @{handle} ({idx + 1}/{len(handles)})")
+                        chrome_lock.update_progress(f"Scraping @{handle} ({idx + 1}/{len(monitored_handles)})")
                         
-                        logger.info(f"📥 Scraping @{handle}...")
+                        logger.info(f"📥 Scraping @{handle} ({display_name}, {relationship.value})...")
                         
                         try:
                             # Scrape posts from this handle
                             posts = await linkedin.scrape_user_posts(
                                 handle=handle,
                                 max_posts=10,  # Check last 10 posts
-                                days_back=7    # Within last 7 days
+                                days_back=7,   # Within last 7 days
+                                author_name=display_name  # Use display name from database
                             )
                             
                             logger.info(f"✅ Scraped {len(posts)} posts from @{handle}")
                             total_scraped += len(posts)
+                            
+                            # Update last_scraped_at timestamp
+                            from datetime import datetime
+                            monitored_handle.last_scraped_at = datetime.utcnow()
+                            await db.commit()
                             
                             # Update health monitoring
                             await update_last_successful_scrape(db)
@@ -407,7 +424,9 @@ async def scheduled_scrape_and_process():
                                     variant_texts = await ai_service.generate_variants(
                                         original_content=post_data.content,
                                         author_name=post_data.author_name,
-                                        num_variants=3
+                                        num_variants=3,
+                                        relationship=relationship.value,
+                                        custom_context=custom_context
                                     )
                                     
                                     # Save variants to database
@@ -469,7 +488,7 @@ async def scheduled_scrape_and_process():
                             total_failed += 1
                         
                         # Add human-like delay between profiles (except after last one)
-                        if idx < len(handles) - 1:
+                        if idx < len(monitored_handles) - 1:
                             from app.utils import random_profile_delay
                             random_profile_delay()
                 
@@ -627,7 +646,7 @@ async def lifespan(app: FastAPI):
         logger.info(f"   Environment: {settings.infisical_environment}")
         logger.info(f"   AI Model: {settings.ai_model}")
         logger.info(f"   Timezone: {settings.timezone}")
-        logger.info(f"   Monitoring handles: {settings.linkedin_handles}")
+        logger.info(f"   Monitored handles: loaded from database")
     except Exception as e:
         logger.error(f"❌ Failed to load configuration: {e}")
         raise
@@ -962,17 +981,43 @@ async def admin_dashboard(
                 'status': variant.status.value
             })
         
+        # Calculate priority level based on post age
+        priority_level = None
+        if post.original_post_date:
+            from datetime import datetime, timezone
+            age_hours = (datetime.now(timezone.utc) - post.original_post_date.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+            if age_hours <= 24:
+                priority_level = "URGENT"
+            elif age_hours <= 48:
+                priority_level = "GOOD"
+            elif age_hours <= 168:  # 7 days
+                priority_level = "OK"
+            elif age_hours <= 336:  # 14 days
+                priority_level = "STALE"
+            else:
+                priority_level = "DEAD"
+        
         posts_data.append({
             'id': post.id,
             'author_name': post.author_name,
             'author_handle': post.author_handle,
             'original_content': post.original_content,
+            'original_post_url': post.original_post_url,
             'status': post.status.value,
             'post_date': post.original_post_date.strftime('%Y-%m-%d %H:%M') if post.original_post_date else post.scraped_at.strftime('%Y-%m-%d %H:%M'),
+            'priority_level': priority_level,
             'variants': variants_data
         })
     
     html = get_dashboard_html(posts_data, stats, settings, current_status=status, current_author=author, authors=unique_authors, schedule=schedule_data)
+    return HTMLResponse(content=html)
+
+
+@app.get("/admin/handles")
+async def admin_handles_page():
+    """Admin page for managing monitored handles."""
+    with open("/tmp/handles_admin.html", "r") as f:
+        html = f.read()
     return HTMLResponse(content=html)
 
 
@@ -1052,11 +1097,23 @@ async def admin_regenerate_variants(
     # Generate new variants
     ai_service = get_ai_service()
     
+    # Fetch relationship context from monitored handle
+    from app.models import MonitoredHandle
+    handle_result = await db.execute(
+        select(MonitoredHandle).where(MonitoredHandle.handle == post.author_handle)
+    )
+    monitored_handle = handle_result.scalar_one_or_none()
+    
+    relationship = monitored_handle.relationship.value if monitored_handle else None
+    custom_context = monitored_handle.custom_context if monitored_handle else None
+    
     try:
         variants = await ai_service.generate_variants(
             original_content=post.original_content,
             author_name=post.author_name,
-            num_variants=3
+            num_variants=3,
+            relationship=relationship,
+            custom_context=custom_context
         )
         
         # Create new variant records
@@ -1235,13 +1292,9 @@ async def admin_post_now(
                 detail=f"Cannot post - status is {scheduled_post.status.value}"
             )
         
-        # Initialize LinkedIn service
+        # Initialize LinkedIn service  
         settings = get_settings()
-        linkedin = get_selenium_linkedin_service(
-            headless=False,  # Always non-headless so VNC shows security challenges
-            email=settings.linkedin_email,
-            password=settings.linkedin_password
-        )
+        linkedin = get_linkedin_service()
         
         try:
             logger.info(f"📤 Manual post: Publishing post {scheduled_post.post_id} immediately")
@@ -2616,8 +2669,8 @@ async def linkedin_cookie_auth(auth_request: LinkedInCookieAuth):
     """
     log_operation_start(logger, "linkedin_cookie_auth")
     
-    # Use Selenium implementation instead of Playwright
-    linkedin = get_selenium_linkedin_service()
+    # Use Playwright implementation
+    linkedin = get_linkedin_service()
     
     try:
         logger.info("🔐 Authenticating with li_at cookie (Selenium)...")
@@ -2757,8 +2810,8 @@ async def linkedin_scrape(
     email = settings.linkedin_email
     password = settings.linkedin_password
     
-    # Use Selenium implementation with auto-login
-    linkedin = get_selenium_linkedin_service(email=email, password=password)
+    # Use Playwright implementation
+    linkedin = get_linkedin_service()
     
     try:
         # Scrape posts with configured lookback
@@ -2862,13 +2915,9 @@ async def linkedin_repost(
     # Import health monitoring
     from app.health_monitor import update_last_successful_post, increment_failed_posts
     
-    # Use Selenium service for reposting
+    # Use Playwright service for reposting
     settings = get_settings()
-    linkedin = get_selenium_linkedin_service(
-        headless=False,  # Always non-headless so VNC shows security challenges
-        email=settings.linkedin_email,
-        password=settings.linkedin_password
-    )
+    linkedin = get_linkedin_service()
     
     try:
         # Get post from database
@@ -3326,6 +3375,176 @@ async def cancel_scheduled_post(
             status_code=500,
             detail=f"Failed to cancel scheduled post: {str(e)}"
         )
+
+
+# ============================================================================
+# Monitored Handles Management API
+# ============================================================================
+
+@app.get("/handles", response_model=List[MonitoredHandleResponse])
+async def get_monitored_handles(
+    active_only: bool = False,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get all monitored LinkedIn handles.
+    
+    Query params:
+    - active_only: If true, only return active handles
+    """
+    log_operation_start(logger, "get_monitored_handles", active_only=active_only)
+    
+    try:
+        from app.models import MonitoredHandle
+        
+        query = select(MonitoredHandle).order_by(MonitoredHandle.handle)
+        
+        if active_only:
+            query = query.where(MonitoredHandle.is_active == True)
+        
+        result = await db.execute(query)
+        handles = result.scalars().all()
+        
+        log_operation_success(logger, "get_monitored_handles", count=len(handles))
+        return handles
+        
+    except Exception as e:
+        log_operation_error(logger, "get_monitored_handles", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/handles", response_model=MonitoredHandleResponse)
+async def create_monitored_handle(
+    handle_data: MonitoredHandleCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    """Create a new monitored handle."""
+    log_operation_start(logger, "create_monitored_handle", handle=handle_data.handle)
+    
+    try:
+        from app.models import MonitoredHandle
+        
+        # Check if handle already exists
+        result = await db.execute(
+            select(MonitoredHandle).where(MonitoredHandle.handle == handle_data.handle)
+        )
+        existing = result.scalar_one_or_none()
+        
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Handle @{handle_data.handle} is already being monitored"
+            )
+        
+        # Create new handle
+        new_handle = MonitoredHandle(
+            handle=handle_data.handle,
+            display_name=handle_data.display_name,
+            relationship=handle_data.relationship,
+            custom_context=handle_data.custom_context,
+            is_active=handle_data.is_active
+        )
+        
+        db.add(new_handle)
+        await db.commit()
+        await db.refresh(new_handle)
+        
+        logger.info(f"✅ Created monitored handle: @{handle_data.handle} ({handle_data.relationship})")
+        log_operation_success(logger, "create_monitored_handle", handle=handle_data.handle)
+        
+        return new_handle
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_operation_error(logger, "create_monitored_handle", e)
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/handles/{handle_id}", response_model=MonitoredHandleResponse)
+async def update_monitored_handle(
+    handle_id: int,
+    handle_data: MonitoredHandleUpdate,
+    db: AsyncSession = Depends(get_db)
+):
+    """Update an existing monitored handle."""
+    log_operation_start(logger, "update_monitored_handle", handle_id=handle_id)
+    
+    try:
+        from app.models import MonitoredHandle
+        
+        # Get existing handle
+        result = await db.execute(
+            select(MonitoredHandle).where(MonitoredHandle.id == handle_id)
+        )
+        handle = result.scalar_one_or_none()
+        
+        if not handle:
+            raise HTTPException(status_code=404, detail=f"Handle {handle_id} not found")
+        
+        # Update fields
+        if handle_data.display_name is not None:
+            handle.display_name = handle_data.display_name
+        if handle_data.relationship is not None:
+            handle.relationship = handle_data.relationship
+        if handle_data.custom_context is not None:
+            handle.custom_context = handle_data.custom_context
+        if handle_data.is_active is not None:
+            handle.is_active = handle_data.is_active
+        
+        await db.commit()
+        await db.refresh(handle)
+        
+        logger.info(f"✅ Updated monitored handle: @{handle.handle}")
+        log_operation_success(logger, "update_monitored_handle", handle_id=handle_id)
+        
+        return handle
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_operation_error(logger, "update_monitored_handle", e)
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/handles/{handle_id}")
+async def delete_monitored_handle(
+    handle_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete a monitored handle."""
+    log_operation_start(logger, "delete_monitored_handle", handle_id=handle_id)
+    
+    try:
+        from app.models import MonitoredHandle
+        
+        # Get existing handle
+        result = await db.execute(
+            select(MonitoredHandle).where(MonitoredHandle.id == handle_id)
+        )
+        handle = result.scalar_one_or_none()
+        
+        if not handle:
+            raise HTTPException(status_code=404, detail=f"Handle {handle_id} not found")
+        
+        handle_name = handle.handle
+        
+        await db.delete(handle)
+        await db.commit()
+        
+        logger.info(f"🗑️  Deleted monitored handle: @{handle_name}")
+        log_operation_success(logger, "delete_monitored_handle", handle_id=handle_id)
+        
+        return {"success": True, "message": f"Handle @{handle_name} deleted"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_operation_error(logger, "delete_monitored_handle", e)
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

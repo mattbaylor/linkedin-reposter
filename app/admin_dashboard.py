@@ -19,6 +19,7 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                 'GOOD': '#28a745',
                 'OK': '#ffc107',
                 'STALE': '#6c757d',
+                'DEAD': '#000000',
                 'NORMAL': '#17a2b8'
             }.get(sched.get('priority_level', 'NORMAL'), '#17a2b8')
             
@@ -75,16 +76,38 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
             </div>
             """
         
+        # Generate priority badge if available
+        priority_badge = ""
+        if post.get('priority_level'):
+            priority_color = {
+                'URGENT': '#dc3545',
+                'GOOD': '#28a745',
+                'OK': '#ffc107',
+                'STALE': '#6c757d',
+                'DEAD': '#000000',
+                'NORMAL': '#17a2b8'
+            }.get(post['priority_level'], '#17a2b8')
+            priority_badge = f'<span class="badge" style="background-color: {priority_color}; margin-left: 8px;">{post["priority_level"]}</span>'
+        
+        # Generate LinkedIn URL link if available
+        linkedin_link = ""
+        if post.get('original_post_url'):
+            linkedin_link = f'<a href="{post["original_post_url"]}" target="_blank" style="color: #0a66c2; text-decoration: none; margin-left: 10px;" title="View original post on LinkedIn">🔗 View on LinkedIn</a>'
+        
         posts_html += f"""
         <div class="post-card">
             <div class="post-header">
                 <div class="post-meta">
                     <strong>{post['author_name']}</strong> (@{post['author_handle']})
                     <span class="post-date">{post['post_date']}</span>
+                    {linkedin_link}
                 </div>
-                <span class="badge status-{post['status'].replace('_', '-')}" style="background-color: {status_color}">
-                    {post['status'].replace('_', ' ').title()}
-                </span>
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <span class="badge status-{post['status'].replace('_', '-')}" style="background-color: {status_color}">
+                        {post['status'].replace('_', ' ').title()}
+                    </span>
+                    {priority_badge}
+                </div>
             </div>
             <div class="post-content">
                 <div class="original-post">
@@ -479,6 +502,7 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                 <h1>📊 LinkedIn Reposter - Admin Dashboard</h1>
                 <div class="nav-links">
                     <a href="/admin/dashboard">🏠 Dashboard</a>
+                    <a href="/admin/handles">👥 Handles</a>
                     <a href="/admin/vnc">🖥️ VNC Viewer</a>
                     <a href="/stats">📈 Stats API</a>
                     <a href="/docs">📚 API Docs</a>

@@ -182,7 +182,6 @@ def load_config() -> Settings:
             ("postal_api_key", "POSTAL_API_KEY"),
             ("postal_server_url", "POSTAL_SERVER_URL"),
             ("approval_email", "APPROVAL_EMAIL"),
-            ("linkedin_handles", "LINKEDIN_HANDLES"),
             ("app_base_url", "APP_BASE_URL"),
         ]
         

@@ -229,3 +229,39 @@ class LinkedInCookieAuth(BaseModel):
 # Resolve forward references
 LinkedInPostDetailResponse.model_rebuild()
 
+
+# ============================================================================
+# Monitored Handles Schemas
+# ============================================================================
+
+class MonitoredHandleBase(BaseModel):
+    """Base schema for monitored handles."""
+    handle: str = Field(min_length=1, max_length=100, description="LinkedIn handle (without @)")
+    display_name: Optional[str] = Field(None, max_length=200, description="Display name")
+    relationship: str = Field(description="Relationship type")
+    custom_context: Optional[str] = Field(None, description="Additional context for AI")
+
+
+class MonitoredHandleCreate(MonitoredHandleBase):
+    """Schema for creating a monitored handle."""
+    is_active: bool = True
+
+
+class MonitoredHandleUpdate(BaseModel):
+    """Schema for updating a monitored handle."""
+    display_name: Optional[str] = None
+    relationship: Optional[str] = None
+    custom_context: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class MonitoredHandleResponse(MonitoredHandleBase):
+    """Schema for monitored handle response."""
+    id: int
+    is_active: bool
+    created_at: datetime
+    last_scraped_at: Optional[datetime] = None
+    
+    class Config:
+        from_attributes = True
+
