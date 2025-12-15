@@ -87,7 +87,7 @@ class LinkedInPost(Base):
     """Original LinkedIn post scraped from monitored handles."""
     __tablename__ = "linkedin_posts"
     
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     
     # Source information
     original_post_url: Mapped[str] = mapped_column(String(500), index=True, nullable=True)  # Not unique - using fuzzy match instead
@@ -144,7 +144,7 @@ class PostVariant(Base):
     """AI-generated variant of a LinkedIn post."""
     __tablename__ = "post_variants"
     
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     
     # Foreign key to original post
     original_post_id: Mapped[int] = mapped_column(ForeignKey("linkedin_posts.id"), index=True)
@@ -180,7 +180,7 @@ class ApprovalRequest(Base):
     """Tracks approval requests sent via email."""
     __tablename__ = "approval_requests"
     
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     
     # Foreign key to original post
     original_post_id: Mapped[int] = mapped_column(
@@ -235,7 +235,7 @@ class ScheduledPost(Base):
     """Post scheduled for future publishing with intelligent spacing."""
     __tablename__ = "scheduled_posts"
     
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     
     # Foreign key to original post
     post_id: Mapped[int] = mapped_column(ForeignKey("linkedin_posts.id"), index=True)
@@ -279,7 +279,7 @@ class SystemHealth(Base):
     """Tracks system health metrics and alerts."""
     __tablename__ = "system_health"
     
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     
     # Health tracking
     last_successful_post_time: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
@@ -305,7 +305,7 @@ class MonitoredHandle(Base):
     """LinkedIn handles to monitor for reposts with relationship context."""
     __tablename__ = "monitored_handles"
     
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     
     # Handle information
     handle: Mapped[str] = mapped_column(String(100), unique=True, index=True)  # e.g., "tylercowen"

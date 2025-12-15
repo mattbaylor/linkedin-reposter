@@ -859,14 +859,37 @@ class LinkedInAutomation:
                 logger.warning(f"⚠️  No content found for post. Tried selectors: {content_selectors}")
                 return None
             
-            # Extract timestamp
-            time_elem = await element.query_selector('time, .update-components-actor__sub-description')
-            time_text = await time_elem.inner_text() if time_elem else ""
+            # Extract timestamp - try multiple selectors
+            time_selectors = [
+                'time',  # Standard HTML5 time element
+                '.update-components-actor__sub-description time',  # Time within sub-description
+                '.update-components-actor__sub-description > span:last-child',  # Last span in subdesc
+                '.feed-shared-actor__sub-description time',  # Alternative actor description
+                '.feed-shared-actor__sub-description',  # Fallback to whole subdesc
+                '.update-components-actor__sub-description',  # Original fallback
+            ]
             
-            logger.debug(f"🔍 DEBUG: time_text = {time_text}")
+            time_elem = None
+            time_text = ""
+            
+            for selector in time_selectors:
+                time_elem = await element.query_selector(selector)
+                if time_elem:
+                    time_text = await time_elem.inner_text()
+                    time_html = await time_elem.inner_html() if len(time_text) > 100 else ""  # Only get HTML if text is long
+                    logger.info(f"🔍 DEBUG: Found time with selector '{selector}'")
+                    logger.info(f"🔍 DEBUG: time_text = '{time_text}'")
+                    if time_html:
+                        logger.info(f"🔍 DEBUG: time_html (first 200) = '{time_html[:200]}'")
+                    break
+            
+            if not time_elem:
+                logger.warning(f"⚠️  No time element found with any selector")
             
             # Parse relative time
             post_date = self._parse_relative_time(time_text)
+            
+            logger.info(f"🔍 DEBUG: parsed post_date = {post_date}")
             
             return LinkedInPost(
                 url=post_url or f"https://www.linkedin.com/in/{handle}/",
@@ -885,22 +908,41 @@ class LinkedInAutomation:
         now = datetime.utcnow()
         time_text = time_text.lower().strip()
         
-        try:
-            if 'h' in time_text or 'hour' in time_text:
-                hours = int(''.join(filter(str.isdigit, time_text)))
-                return now - timedelta(hours=hours)
-            elif 'd' in time_text or 'day' in time_text:
-                days = int(''.join(filter(str.isdigit, time_text)))
-                return now - timedelta(days=days)
-            elif 'w' in time_text or 'week' in time_text:
-                weeks = int(''.join(filter(str.isdigit, time_text)))
-                return now - timedelta(weeks=weeks)
-            elif 'm' in time_text or 'mo' in time_text:
-                months = int(''.join(filter(str.isdigit, time_text)))
-                return now - timedelta(days=months * 30)
-        except:
-            pass
+        logger.info(f"🔍 DEBUG: _parse_relative_time input = '{time_text}'")
         
+        # If empty, return now
+        if not time_text:
+            logger.warning("⚠️  Empty time_text, using current time")
+            return now
+        
+        # Try to extract just the time part if there's extra text
+        # Look for patterns like "2h", "3d", "1w", "2mo"
+        import re
+        time_pattern = r'(\d+)\s*([hdwm]|hour|day|week|month|mo)'
+        match = re.search(time_pattern, time_text, re.IGNORECASE)
+        
+        if match:
+            number = int(match.group(1))
+            unit = match.group(2).lower()
+            
+            logger.info(f"🔍 DEBUG: Extracted {number} {unit}")
+            
+            if unit in ['h', 'hour']:
+                result = now - timedelta(hours=number)
+            elif unit in ['d', 'day']:
+                result = now - timedelta(days=number)
+            elif unit in ['w', 'week']:
+                result = now - timedelta(weeks=number)
+            elif unit in ['m', 'mo', 'month']:
+                result = now - timedelta(days=number * 30)
+            else:
+                logger.warning(f"⚠️  Unknown time unit '{unit}', using current time")
+                result = now
+            
+            logger.info(f"🔍 DEBUG: Calculated date = {result}")
+            return result
+        
+        logger.warning(f"⚠️  Could not parse time from '{time_text}', using current time")
         return now
 
 

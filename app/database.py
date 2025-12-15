@@ -2,6 +2,7 @@
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.pool import StaticPool
+from sqlalchemy import event, text
 from .models import Base
 from .config import get_settings
 import logging
@@ -32,9 +33,21 @@ async def init_db() -> None:
     engine = create_async_engine(
         database_url,
         echo=False,  # Set to True for SQL query logging
-        connect_args={"check_same_thread": False},
+        connect_args={
+            "check_same_thread": False,
+            # Enable foreign key constraints for SQLite
+            "isolation_level": None,  # Required for PRAGMA to work
+        },
         poolclass=StaticPool,  # Use StaticPool for SQLite
     )
+    
+    # Enable foreign key constraints for SQLite connections
+    # This ensures referential integrity (cascading deletes, etc.)
+    @event.listens_for(engine.sync_engine, "connect")
+    def set_sqlite_pragma(dbapi_conn, connection_record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
     
     # Create session maker
     async_session_maker = async_sessionmaker(
@@ -47,6 +60,8 @@ async def init_db() -> None:
     
     # Create all tables
     async with engine.begin() as conn:
+        # Enable foreign key constraints for this connection
+        await conn.execute(text("PRAGMA foreign_keys=ON"))
         await conn.run_sync(Base.metadata.create_all)
     
     logger.info("✅ Database initialized successfully")
@@ -76,6 +91,8 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
     
     async with async_session_maker() as session:
         try:
+            # Enable foreign keys for this session (SQLite specific)
+            await session.execute(text("PRAGMA foreign_keys=ON"))
             yield session
             await session.commit()
         except Exception:
