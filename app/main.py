@@ -976,6 +976,11 @@ async def admin_dashboard(
     # Convert scheduled posts to dict
     schedule_data = []
     for sched in scheduled_posts:
+        # Skip if post or variant is missing (orphaned record)
+        if not sched.post or not sched.variant:
+            logger.warning(f"⚠️  Skipping scheduled post {sched.id} with missing post or variant")
+            continue
+            
         schedule_data.append({
             'id': sched.id,
             'post_id': sched.post_id,
