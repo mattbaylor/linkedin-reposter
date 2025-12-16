@@ -918,31 +918,42 @@ class LinkedInAutomation:
             return now
         
         # Try to extract just the time part if there's extra text
-        # Look for patterns like "2h", "3d", "1w", "2mo"
+        # Look for patterns like "2h", "3d", "1w", "2mo", "1 week ago", "2 months ago"
         import re
-        time_pattern = r'(\d+)\s*([hdwm]|hour|day|week|month|mo)'
-        match = re.search(time_pattern, time_text, re.IGNORECASE)
         
-        if match:
-            number = int(match.group(1))
-            unit = match.group(2).lower()
-            
-            logger.info(f"🔍 DEBUG: Extracted {number} {unit}")
-            
-            if unit in ['h', 'hour']:
-                result = now - timedelta(hours=number)
-            elif unit in ['d', 'day']:
-                result = now - timedelta(days=number)
-            elif unit in ['w', 'week']:
-                result = now - timedelta(weeks=number)
-            elif unit in ['m', 'mo', 'month']:
-                result = now - timedelta(days=number * 30)
-            else:
-                logger.warning(f"⚠️  Unknown time unit '{unit}', using current time")
-                result = now
-            
-            logger.info(f"🔍 DEBUG: Calculated date = {result}")
-            return result
+        # Try multiple patterns in order of specificity
+        patterns = [
+            # Full word patterns (more specific, try first)
+            (r'(\d+)\s+months?\s+ago', 'month'),
+            (r'(\d+)\s+weeks?\s+ago', 'week'),
+            (r'(\d+)\s+days?\s+ago', 'day'),
+            (r'(\d+)\s+hours?\s+ago', 'hour'),
+            # Short form patterns
+            (r'(\d+)\s*mo\b', 'month'),
+            (r'(\d+)\s*w\b', 'week'),
+            (r'(\d+)\s*d\b', 'day'),
+            (r'(\d+)\s*h\b', 'hour'),
+        ]
+        
+        for pattern, unit_name in patterns:
+            match = re.search(pattern, time_text, re.IGNORECASE)
+            if match:
+                number = int(match.group(1))
+                result = now  # Initialize with fallback value
+                
+                logger.info(f"🔍 DEBUG: Extracted {number} {unit_name} using pattern '{pattern}'")
+                
+                if unit_name == 'hour':
+                    result = now - timedelta(hours=number)
+                elif unit_name == 'day':
+                    result = now - timedelta(days=number)
+                elif unit_name == 'week':
+                    result = now - timedelta(weeks=number)
+                elif unit_name == 'month':
+                    result = now - timedelta(days=number * 30)
+                
+                logger.info(f"🔍 DEBUG: Calculated date = {result}")
+                return result
         
         logger.warning(f"⚠️  Could not parse time from '{time_text}', using current time")
         return now
