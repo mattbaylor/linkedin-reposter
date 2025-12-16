@@ -1021,6 +1021,17 @@ async def admin_dashboard(
             else:
                 priority_level = "DEAD"
         
+        # Format post date in local time for display
+        if post.original_post_date:
+            # Convert UTC to local time for display
+            from datetime import timezone
+            import time
+            utc_date = post.original_post_date.replace(tzinfo=timezone.utc)
+            local_date = utc_date.astimezone()
+            post_date_str = local_date.strftime('%Y-%m-%d %H:%M')
+        else:
+            post_date_str = post.scraped_at.strftime('%Y-%m-%d %H:%M')
+        
         posts_data.append({
             'id': post.id,
             'author_name': post.author_name,
@@ -1028,7 +1039,7 @@ async def admin_dashboard(
             'original_content': post.original_content,
             'original_post_url': post.original_post_url,
             'status': post.status.value,
-            'post_date': post.original_post_date.strftime('%Y-%m-%d %H:%M') if post.original_post_date else post.scraped_at.strftime('%Y-%m-%d %H:%M'),
+            'post_date': post_date_str,
             'priority_level': priority_level,
             'variants': variants_data
         })

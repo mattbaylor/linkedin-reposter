@@ -611,7 +611,6 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                     }});
                     
                     if (response.ok) {{
-                        alert('✅ Variant approved! Post will be queued for publishing.');
                         window.location.reload();
                     }} else {{
                         const error = await response.json();
@@ -633,7 +632,6 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                     }});
                     
                     if (response.ok) {{
-                        alert('✅ Variants regenerated successfully!');
                         window.location.reload();
                     }} else {{
                         const error = await response.json();
@@ -655,7 +653,6 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                     }});
                     
                     if (response.ok) {{
-                        alert('✅ Post rejected');
                         window.location.reload();
                     }} else {{
                         const error = await response.json();
@@ -675,7 +672,6 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                     }});
                     
                     if (response.ok) {{
-                        alert('✅ Post deleted');
                         window.location.reload();
                     }} else {{
                         const error = await response.json();
@@ -695,7 +691,6 @@ def get_dashboard_html(posts_data: list, stats: dict, settings, current_status: 
                     }});
                     
                     if (response.ok) {{
-                        alert('✅ Removed from schedule');
                         window.location.reload();
                     }} else {{
                         const error = await response.json();
