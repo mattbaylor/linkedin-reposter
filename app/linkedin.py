@@ -596,7 +596,8 @@ class LinkedInAutomation:
             
             # Extract posts
             posts = []
-            cutoff_date = datetime.utcnow() - timedelta(days=days_back)
+            now = datetime.utcnow()
+            cutoff_date = now - timedelta(days=days_back)
             
             log_workflow_step(logger, "Extracting post data")
             
@@ -638,12 +639,13 @@ class LinkedInAutomation:
                     post_data = await self._extract_post_data(element, handle, author_name)
                     
                     if post_data:
-                        logger.info(f"📅 Post date: {post_data.post_date}, Cutoff: {cutoff_date}")
+                        age_days = (now - post_data.post_date).days
+                        logger.info(f"📅 Post date: {post_data.post_date}, Age: {age_days} days, Cutoff: {cutoff_date}")
                         if post_data.post_date >= cutoff_date:
                             posts.append(post_data)
-                            logger.info(f"✅ Scraped post: {post_data.content[:50]}...")
+                            logger.info(f"✅ Scraped post ({age_days}d old): {post_data.content[:80]}...")
                         else:
-                            logger.info(f"⏭️  Skipping old post (older than {days_back} days)")
+                            logger.info(f"⏭️  Skipping old post ({age_days}d old, threshold: {days_back}d): {post_data.content[:80]}...")
                     
                 except Exception as e:
                     logger.warning(f"⚠️  Failed to extract post data: {e}")
